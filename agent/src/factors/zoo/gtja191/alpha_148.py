@@ -39,13 +39,13 @@ ALPHA_ID = "gtja191_148"
 __alpha_meta__ = {
     'id': 'gtja191_148',
     'theme': ['volume'],
-    'formula_latex': 'see body',
+    'formula_latex': '((RANK(CORR((OPEN), SUM(MEAN(VOLUME,60), 9), 6)) < RANK((OPEN - MIN(OPEN, 14)))) * -1)',
     'columns_required': ['open', 'high', 'low', 'close', 'volume'],
     'extras_required': [],
     'universe': ['equity_cn'],
     'frequency': ['1d'],
     'decay_horizon': 60,
-    'min_warmup_bars': 75,
+    'min_warmup_bars': 73,
     'notes': '',
 }
 
@@ -63,5 +63,6 @@ def compute(panel):
     v = panel["volume"]
     left = rank(ts_corr(o, ts_mean(v, 60).rolling(9).sum(), 6))
     right = rank(o - ts_min(o, 14))
-    out = (left < right).astype("float64") * -1.0
+    # A comparison with a missing side is missing, not False (#1463).
+    out = (left < right).astype("float64").where(left.notna() & right.notna()) * -1.0
     return out

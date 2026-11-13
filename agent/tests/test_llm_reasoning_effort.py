@@ -2,7 +2,7 @@
 
 The setting has two mutually exclusive delivery paths:
 
-* Relays that require an opt-in (OpenRouter, Requesty) receive
+* Relays that require an opt-in (OpenRouter) receive
   ``extra_body={"reasoning": {"effort": ...}}``.
 * ChatOpenAI-compatible providers receive a top-level ``reasoning_effort``. Its ``gpt-5.6-*``
   models reject function tools on ``/v1/chat/completions`` without one::
@@ -52,9 +52,7 @@ def settings_env_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def settings_client(
-    tmp_path: Path, settings_env_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> TestClient:
+def settings_client(tmp_path: Path, settings_env_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     """Serve the settings API against a throwaway .env pair in tmp_path."""
     env_example = tmp_path / ".env.example"
     env_example.write_text(
@@ -70,9 +68,7 @@ def settings_client(
         encoding="utf-8",
     )
     monkeypatch.setattr(api_server, "ENV_PATH", settings_env_path)
-    monkeypatch.setattr(
-        api_server, "LEGACY_ENV_PATH", tmp_path / "legacy" / ".env", raising=False
-    )
+    monkeypatch.setattr(api_server, "LEGACY_ENV_PATH", tmp_path / "legacy" / ".env", raising=False)
     monkeypatch.setattr(api_server, "ENV_EXAMPLE_PATH", env_example)
     monkeypatch.delenv("API_AUTH_KEY", raising=False)
     return TestClient(api_server.app, client=("127.0.0.1", 50000))
@@ -272,16 +268,16 @@ class TestUnsupportedProviders:
         """The allowlist stays short and every entry is accounted for here.
 
         A new provider flipping ``top_level_reasoning_effort=True`` has to be
-        added to this set deliberately, with live evidence, rather than picked
-        up by a broad predicate. If this fails, someone widened the allowlist —
-        confirm a real request to that endpoint succeeded before updating it.
+        added to this set deliberately, with live evidence (or, for moonshot,
+        its published contract — issue #2020, pending live confirmation; see
+        its entry in capabilities.py), rather than picked up by a broad
+        predicate. If this fails, someone widened the allowlist — confirm a
+        real request to that endpoint succeeded before updating it.
         """
         from src.providers.capabilities import _PROVIDERS
 
-        allowlisted = {
-            name for name, caps in _PROVIDERS.items() if caps.top_level_reasoning_effort
-        }
-        assert allowlisted == {"openai", "deepseek"}
+        allowlisted = {name for name, caps in _PROVIDERS.items() if caps.top_level_reasoning_effort}
+        assert allowlisted == {"openai", "deepseek", "moonshot", "kimi"}
 
     def test_explicit_openai_provider_keeps_effort_for_deepseek_model(self) -> None:
         kwargs = _capture_kwargs(
@@ -311,6 +307,110 @@ class TestUnsupportedProviders:
         )
 
         assert kwargs["reasoning_effort"] == "high"
+
+
+class TestMoonshotKimiK31Scoping:
+    """Moonshot takes the top-level effort only for kimi-k3.1 on its own host.
+
+    Moonshot's published contract (issue #2020,
+    https://platform.kimi.ai/docs/guide/use-reasoning-effort.md) documents
+    ``reasoning_effort`` for ``kimi-k3.1(-highspeed)`` on api.moonshot.ai and
+    nowhere else — other Kimi models, relays and self-hosted gateways behind
+    ``MOONSHOT_BASE_URL`` must not receive the field.
+    """
+
+    def _env(self, **overrides: str) -> dict[str, str]:
+        """Return a minimal official-endpoint Moonshot environment."""
+        env = {
+            "LANGCHAIN_PROVIDER": "moonshot",
+            "MOONSHOT_API_KEY": "ms-test",
+            "MOONSHOT_BASE_URL": "https://api.moonshot.ai/v1",
+            "LANGCHAIN_MODEL_NAME": "kimi-k3.1-pro",
+            "LANGCHAIN_REASONING_EFFORT": "high",
+            "LANGCHAIN_USE_RESPONSES_API": "false",
+        }
+        env.update(overrides)
+        return env
+
+    @pytest.mark.parametrize("model", ["kimi-k3.1-pro", "kimi-k3.1-pro-highspeed"])
+    def test_k31_models_on_the_official_endpoint_receive_the_field(self, model: str) -> None:
+        kwargs = _capture_kwargs(self._env(LANGCHAIN_MODEL_NAME=model))
+
+        assert kwargs["reasoning_effort"] == "high"
+        assert kwargs["extra_body"] is None
+
+    def test_a_k2_model_is_not_sent_the_field(self) -> None:
+        """The allowlist is per model: kimi-k2 never published this field."""
+        kwargs = _capture_kwargs(self._env(LANGCHAIN_MODEL_NAME="kimi-k2-0905-preview"))
+
+        assert kwargs["reasoning_effort"] is None
+        assert kwargs["extra_body"] is None
+
+    def test_a_relayed_base_url_is_not_sent_the_field(self) -> None:
+        """A MOONSHOT_BASE_URL override takes the published contract with it.
+
+        Relays and self-hosted gateways speak the OpenAI wire format without
+        promising to accept every Moonshot field, so only api.moonshot.ai
+        authorizes the send.
+        """
+        kwargs = _capture_kwargs(self._env(MOONSHOT_BASE_URL="https://gateway.example/v1"))
+
+        assert kwargs["reasoning_effort"] is None
+
+    def test_an_unset_effort_stays_absent(self) -> None:
+        kwargs = _capture_kwargs(self._env(LANGCHAIN_REASONING_EFFORT=""))
+
+        assert kwargs["reasoning_effort"] is None
+
+    def test_medium_is_rejected_naming_the_accepted_values(self) -> None:
+        """kimi-k3.1 has no medium level; fail fast instead of at the API.
+
+        Moonshot publishes low/high/max only, so a stored 'medium' would 400
+        server-side on every call. The message carries the offending value and
+        the full accepted set so the fix needs no doc lookup.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            _capture_kwargs(self._env(LANGCHAIN_REASONING_EFFORT="medium"))
+
+        message = str(excinfo.value)
+        assert "'medium'" in message
+        for level in ("low", "high", "max"):
+            assert level in message
+        assert "minimal" in message
+
+    def test_medium_stays_allowed_where_the_field_is_never_sent(self) -> None:
+        """Validation rides the send decision: no send, no rejection.
+
+        A relayed URL or an uncovered model never receives the field, so the
+        stored value stays inert — the same no-op-not-error asymmetry the
+        allowlist itself has.
+        """
+        relayed = _capture_kwargs(
+            self._env(LANGCHAIN_REASONING_EFFORT="medium", MOONSHOT_BASE_URL="https://gateway.example/v1")
+        )
+        assert relayed["reasoning_effort"] is None
+
+        k2 = _capture_kwargs(
+            self._env(LANGCHAIN_REASONING_EFFORT="medium", LANGCHAIN_MODEL_NAME="kimi-k2-0905-preview")
+        )
+        assert k2["reasoning_effort"] is None
+
+    def test_diagnostics_report_the_model_scoped_flag(self) -> None:
+        """provider doctor must reflect the per-model decision, not the label.
+
+        Both configurations name the moonshot provider; only the kimi-k3.1 one
+        would actually carry the field, so only that one reports True.
+        """
+
+        def diagnostics(model: str) -> dict[str, Any]:
+            with patch.dict(os.environ, self._env(LANGCHAIN_MODEL_NAME=model), clear=True):
+                return llm_mod.provider_diagnostics()
+
+        k31 = diagnostics("kimi-k3.1-pro")
+        k2 = diagnostics("kimi-k2-0905-preview")
+
+        assert k31["capabilities"]["top_level_reasoning_effort"] is True
+        assert k2["capabilities"]["top_level_reasoning_effort"] is False
 
 
 class TestAnthropicNativeProvider:
@@ -345,9 +445,7 @@ class TestAnthropicNativeProvider:
                 captured.update(kwargs)
 
         with patch.dict(os.environ, env, clear=True):
-            with patch.object(
-                llm_mod, "_make_temperature_safe_anthropic", lambda _: _FakeChatAnthropic
-            ):
+            with patch.object(llm_mod, "_make_temperature_safe_anthropic", lambda _: _FakeChatAnthropic):
                 build_llm()
         return captured
 
@@ -442,9 +540,7 @@ class TestAnthropicNativeProvider:
 
         old_module = SimpleNamespace(ChatAnthropic=_OldChatAnthropic)
 
-        with patch.dict(
-            os.environ, self._env(LANGCHAIN_REASONING_EFFORT="high"), clear=True
-        ):
+        with patch.dict(os.environ, self._env(LANGCHAIN_REASONING_EFFORT="high"), clear=True):
             with patch.object(llm_mod, "import_module", lambda _: old_module):
                 with patch.object(
                     llm_mod,
@@ -469,16 +565,14 @@ class TestAnthropicNativeProvider:
         from langchain_anthropic import ChatAnthropic
         from langchain_core.messages import HumanMessage
 
-        instance = ChatAnthropic(
-            model="claude-fable-5", api_key="sk-ant-test", reasoning_effort="high"
-        )
+        instance = ChatAnthropic(model="claude-fable-5", api_key="sk-ant-test", reasoning_effort="high")
         payload = instance._get_request_payload([HumanMessage(content="hi")])
 
         assert payload["output_config"]["effort"] == "high"
 
 
 class TestRelayOptIn:
-    """OpenRouter/Requesty keep the pre-existing extra_body opt-in."""
+    """OpenRouter keeps the pre-existing extra_body opt-in."""
 
     def test_openrouter_keeps_extra_body_and_no_top_level_field(self) -> None:
         kwargs = _capture_kwargs(
@@ -495,35 +589,38 @@ class TestRelayOptIn:
         assert kwargs["extra_body"] == {"reasoning": {"effort": "high"}}
         assert kwargs["reasoning_effort"] is None
 
-    def test_requesty_keeps_extra_body_and_no_top_level_field(self) -> None:
-        kwargs = _capture_kwargs(
-            {
-                "LANGCHAIN_PROVIDER": "requesty",
-                "REQUESTY_API_KEY": "rq-test",
-                "REQUESTY_BASE_URL": "https://router.requesty.ai/v1",
-                "LANGCHAIN_MODEL_NAME": "openai/gpt-4o-mini",
-                "LANGCHAIN_REASONING_EFFORT": "medium",
-                "LANGCHAIN_USE_RESPONSES_API": "false",
-            }
-        )
-
-        assert kwargs["extra_body"] == {"reasoning": {"effort": "medium"}}
-        assert kwargs["reasoning_effort"] is None
-
 
 class TestRequestPayload:
-    """The kwarg has to survive as a top-level chat-completions request field."""
+    """The kwarg has to survive as a top-level chat-completions request field.
 
-    def _payload(self, effort: str | None) -> dict[str, Any]:
-        """Serialize a one-message request with the given effort kwarg."""
+    Every instance here pins ``use_responses_api=False`` because that is what
+    ``build_llm`` does: it always passes the resolved boolean from
+    ``uses_responses_api`` (never ``None``), so the transport is never left to
+    the library to guess. langchain-openai 1.6 started auto-routing some model
+    names to the Responses API when the flag is unset, which serializes
+    ``{"reasoning": {"effort": ...}}`` into an ``input`` request instead of a
+    top-level ``reasoning_effort`` on a ``messages`` request. Constructing
+    without the flag here tested the library's default, not our wire format.
+    """
+
+    def _payload(self, effort: str | None, *, model: str = "gpt-5.6-sol") -> dict[str, Any]:
+        """Serialize a one-message chat-completions request with the effort kwarg."""
         if llm_mod.ChatOpenAIWithReasoning is None:
             pytest.skip("langchain-openai is not installed")
         from langchain_core.messages import HumanMessage
 
         instance = llm_mod.ChatOpenAIWithReasoning(
-            model="gpt-5.6-sol", api_key="sk-test", reasoning_effort=effort
+            model=model,
+            api_key="sk-test",
+            reasoning_effort=effort,
+            use_responses_api=False,
         )
-        return instance._get_request_payload([HumanMessage(content="hi")])
+        payload = instance._get_request_payload([HumanMessage(content="hi")])
+        # Assert the transport before reading its fields: a Responses payload
+        # carries ``input`` and would fail the effort assertions below with a
+        # bare KeyError that names the field rather than the transport.
+        assert "messages" in payload, sorted(payload)
+        return payload
 
     def test_explicit_none_reaches_the_request(self) -> None:
         assert self._payload("none")["reasoning_effort"] == "none"
@@ -533,19 +630,23 @@ class TestRequestPayload:
         assert "reasoning_effort" not in self._payload(None)
 
     def test_deepseek_flash_effort_is_serialized_for_chat_completions(self) -> None:
-        if llm_mod.ChatOpenAIWithReasoning is None:
-            pytest.skip("langchain-openai is not installed")
-        from langchain_core.messages import HumanMessage
-
-        instance = llm_mod.ChatOpenAIWithReasoning(
-            model="deepseek-v4-flash-0731",
-            api_key="sk-test",
-            reasoning_effort="max",
-        )
-
-        payload = instance._get_request_payload([HumanMessage(content="hi")])
+        payload = self._payload("max", model="deepseek-v4-flash-0731")
 
         assert payload["reasoning_effort"] == "max"
+
+    def test_build_llm_pins_the_transport_it_serializes_for(self) -> None:
+        """The pin above must mirror build_llm, not just make the test pass."""
+        kwargs = _capture_kwargs(
+            {
+                "LANGCHAIN_PROVIDER": "openai",
+                "OPENAI_API_KEY": "sk-test",
+                "LANGCHAIN_MODEL_NAME": "gpt-5.6-sol",
+                "LANGCHAIN_REASONING_EFFORT": "none",
+            }
+        )
+
+        assert kwargs["use_responses_api"] is False
+        assert kwargs["reasoning_effort"] == "none"
 
 
 class TestResponsesAPI:
@@ -719,10 +820,11 @@ class TestSettingsAllowlist:
     """The settings API admits the explicit 'none' value and says so."""
 
     def test_none_is_a_valid_reasoning_effort(self) -> None:
-        from src.api.settings_routes import LLM_REASONING_EFFORTS
+        from src.api.settings_routes import LLM_PROVIDER_BY_NAME
 
-        assert "none" in LLM_REASONING_EFFORTS
-        assert "" in LLM_REASONING_EFFORTS, "empty still means 'leave unset'"
+        # Levels are per provider now; every provider without its own list
+        # inherits the default one, which keeps the explicit "none".
+        assert "none" in LLM_PROVIDER_BY_NAME["openai"].reasoning_efforts
 
     def test_none_persists_through_the_settings_endpoint(
         self, settings_client: TestClient, settings_env_path: Path
@@ -730,13 +832,9 @@ class TestSettingsAllowlist:
         response = settings_client.put("/settings/llm", json=_settings_payload("none"))
 
         assert response.status_code == 200
-        assert "LANGCHAIN_REASONING_EFFORT=none" in settings_env_path.read_text(
-            encoding="utf-8"
-        )
+        assert "LANGCHAIN_REASONING_EFFORT=none" in settings_env_path.read_text(encoding="utf-8")
 
-    def test_rejection_message_lists_every_accepted_value(
-        self, settings_client: TestClient
-    ) -> None:
+    def test_rejection_message_lists_every_accepted_value(self, settings_client: TestClient) -> None:
         """A rejected caller must not be told that only low..max are valid."""
         response = settings_client.put("/settings/llm", json=_settings_payload("bogus"))
 

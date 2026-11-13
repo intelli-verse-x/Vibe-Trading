@@ -7,7 +7,7 @@ This layer is stacked on the desktop lifecycle shell and adds only:
 - the existing production frontend and the upstream hash-locked base Python
   dependencies;
 - the verified native DLL subset required for WeasyPrint PDF output;
-- Electron `safeStorage` for LLM, Tushare, and QVeris credentials.
+- Electron `safeStorage` for LLM, Tushare, and Gildata credentials.
 
 ## Deliberate exclusions
 
@@ -44,6 +44,12 @@ npm run smoke:lifecycle
 npm run installer:win:review
 ```
 
+`installer:win:review` also runs the backend runtime build automatically, so
+running `npm run runtime:win` separately is optional when using that command.
+Run these runtime/installer commands from Windows PowerShell (`powershell.exe`),
+as CI does. Starting them from PowerShell 7 can pass its module search path
+through npm to the Windows PowerShell child and prevent `Get-FileHash` discovery.
+
 The installer and checksum are written under `desktop/electron/release/`.
 The `installer:win:review` artifact is deliberately unsigned and must never be
 published to users. The command strips all supported signing credentials,
@@ -61,15 +67,26 @@ bounded retries, verifies the checksum shipped by the pinned `electron` npm
 package, and extracts that same archive for source-mode smoke tests. Packaging
 therefore never falls through to Electron's unbounded lazy-download path.
 
-The repository-root lock is generated for the upstream Linux environment and
-contains platform-specific dependencies such as `uvloop`. It cannot be reused
-for the Windows runtime. Regenerate the Windows lock only on Windows with
-Python 3.12, from the base requirements (not an optional IM extra):
+The repository-root lock is universal and includes non-Windows branches such
+as `uvloop`. Keep the dedicated Windows x64/Python 3.12 lock for the embedded
+runtime. Generate it from the base requirements (not an optional IM extra),
+either with an explicit target using uv or with Python 3.12 on Windows:
+
+The cross-platform command below is verified with uv 0.13.6. uv 0.11.8 omits
+the Windows `winloop` dependency when evaluating its architecture marker, so
+upgrade uv before using this command.
+
+```bash
+uv pip compile --python-platform x86_64-pc-windows-msvc --python-version 3.12 --generate-hashes --output-file desktop/electron/requirements-windows-lock.txt agent/requirements.txt
+```
 
 ```powershell
 python -m pip install pip-tools
 python -m piptools compile --generate-hashes --allow-unsafe --resolver=backtracking --output-file=desktop/electron/requirements-windows-lock.txt agent/requirements.txt
 ```
+
+After regeneration, run the native Windows runtime and installer checks; a
+successful cross-platform resolution alone does not verify the packaged app.
 
 ## Credential boundary
 
@@ -79,8 +96,7 @@ Electron `safeStorage` uses the operating-system encryption facility for the
 current user. Decrypted values are injected only into the child backend
 environment and are not returned to the renderer.
 
-On first startup, supported secrets in `~/.vibe-trading/.env` and the QVeris
-API key in `~/.vibe-trading/qveris.json` are migrated into encrypted storage.
+On first startup, supported secrets in `~/.vibe-trading/.env` are migrated into encrypted storage.
 The plaintext fields are then removed. Backend settings writes in desktop
 secure mode explicitly blank known credential fields instead of writing the
 injected values back to dotenv.

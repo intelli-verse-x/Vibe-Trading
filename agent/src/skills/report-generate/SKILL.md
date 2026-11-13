@@ -10,7 +10,44 @@ category: tool
 
 Generate structured, professional-grade financial research reports. Follow the conventions used by securities firms and asset managers, and output complete Markdown reports that can be used directly for investment research reference.
 
+## Saving and Delivering a PDF
+
+When the user requests a PDF, send the complete Markdown report to `write_file`
+with a `.pdf` target (prefer `artifacts/report.pdf` under the active run directory).
+The tool renders a real, paginated PDF without requiring system Pango/Cairo.
+Check its returned `status`, `path`, and `bytes_written`; include the returned
+`download_url` as a Markdown link labelled with the report's filename. The Web
+chat downloads it with authentication and IM channels attach the generated PDF.
+A successful write is evidence that the returned path exists; another path's
+earlier rejection does not invalidate it. If rendering fails, report that tool
+error instead of claiming the PDF was created. Do not write HTML or base64 data
+as the content of a `.pdf` file.
+
 ## Report Types and Structure
+
+### Preserve evidence when formatting numbers
+
+For the final chat answer, follow the system's `figures` declaration contract.
+A rounded or scaled financial metric still needs its original tool-call and
+field reference; a human-readable citation alone is not that declaration.
+For example, if the current tool call `c1` actually returned
+`revenue: 96221000000`, the prose may say `Revenue was 96.22B` with:
+
+```figures
+96.22B | observed | Revenue, rounded to two decimals in billions | c1::revenue
+```
+
+Replace that illustrative call id and field with the real ones from this run.
+Use a numeric magnitude (`B`, `M`, `K`, `万`, `亿`) or its full English unit
+(`billion`, `million`, `thousand`) in prose and declaration. A declaration may
+also retain the precise raw observed value while prose rounds it in those units.
+Declare forecast targets as `proposed`, and computations as `derived` with
+their actual operands, rather than labelling them `observed`. The internal
+declaration belongs to the final chat validation contract, not the saved PDF.
+If correction feedback names a missing declaration or mismatched field,
+repair that reference from the evidence before finalizing. Do not replace a
+rejected decimal with an undeclared bare integer to bypass validation, and do
+not fill a genuinely unavailable value from memory.
 
 ### Type Classification
 
@@ -183,7 +220,15 @@ recovered by 2023.06 to a new high of 2.10.
 
 ## Backtest Report Template
 
-After a backtest is completed, read `metrics.csv` and `equity.csv` to generate:
+After a backtest is completed, read the engine-written `metrics.csv` and
+`equity.csv` from that run. Declare reported measurements with the run directory
+or exact engine field as their grounding reference. A metrics file you write
+yourself is not evidence, and a previous run's archive cannot substantiate the
+current call. For list results, use the exact element reference (for example,
+`call_id::data.positions[0].contribution_pct`); correction hints only identify
+candidates to check and cite explicitly.
+
+Use the verified output to generate:
 
 ```markdown
 # Backtest Report: [Strategy Name]

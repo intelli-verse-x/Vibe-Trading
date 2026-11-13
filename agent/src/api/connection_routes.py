@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from src.api.security import require_auth, require_settings_write_auth
 from src.portfolio.compatibility import profile_compatibility
 from src.portfolio.config import PortfolioSettingsStore
+from src.trading.accounts import AccountListUnavailable, choose_account, connection_accounts
 from src.trading.connections import (
     ConnectionStore,
-    TradingConnection,
     credential_fields,
     readonly_profile_catalog,
 )
 from src.trading.local_plugins import plugin_root
 from src.trading.profiles import profile_by_id
-from src.trading.service import check_connection
+from src.trading.service import _ibkr_config, _sdk_config, _sdk_module, check_connection
 
 
 class ConnectionRequest(BaseModel):
@@ -27,10 +29,24 @@ class ConnectionRequest(BaseModel):
     label: str = Field(min_length=1, max_length=80)
 
 
+class AccountSelectionRequest(BaseModel):
+    """Payload selecting the broker account a connection reads; empty clears it."""
+
+    account_ref: str = Field("", max_length=128)
+
+
 class CredentialRequest(BaseModel):
     """Payload carrying credential values for one connection instance."""
 
     values: dict[str, str] = Field(default_factory=dict)
+
+
+class SocketEndpointRequest(BaseModel):
+    """Host and socket port for a broker gateway; never broker credentials."""
+
+    model_config = {"extra": "forbid"}
+    host: str = Field(min_length=1, max_length=253)
+    port: int = Field(strict=True, ge=1, le=65535)
 
 
 def register_connection_routes(app: FastAPI) -> None:
@@ -57,6 +73,18 @@ def register_connection_routes(app: FastAPI) -> None:
             }
             for row in store().public_list()
         ]
+        for row in connections:
+            try:
+                if row["connector"] == "ibkr" and row["transport"] == "local_tws":
+                    config = _ibkr_config(profile_by_id(row["profile_id"]), {"connection_id": row["id"]})
+                elif row["connector"] == "futu" and row["transport"] == "broker_sdk":
+                    config = _sdk_config(profile_by_id(row["profile_id"]), _sdk_module("futu"), {"connection_id": row["id"]})
+                else:
+                    continue
+            except (ValueError, TypeError, RuntimeError) as exc:
+                row["endpoint_error"] = str(exc)
+                continue
+            row["effective_endpoint"] = {"host": config.host, "port": config.port}
         profiles = []
         for row in readonly_profile_catalog():
             if row.get("invalid_plugin"):
@@ -100,18 +128,65 @@ def register_connection_routes(app: FastAPI) -> None:
             current = instance.get(connection_id)
             if payload.profile_id.strip().lower() != current.profile_id:
                 raise ValueError("connection profile cannot be changed")
-            updated = instance.save(
-                TradingConnection(
-                    id=current.id,
-                    profile_id=current.profile_id,
-                    label=payload.label,
-                    credential_ref=current.credential_ref,
-                    created_at=current.created_at,
-                )
-            )
+            # replace() keeps every field the rename does not name, including
+            # the selected account.
+            updated = instance.save(replace(current, label=payload.label))
             return {"status": "ok", "connection": updated.to_dict()}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put(
+        "/api/connections/{connection_id}/endpoint",
+        dependencies=[Depends(require_settings_write_auth)],
+    )
+    def save_connection_endpoint(connection_id: str, payload: SocketEndpointRequest):
+        """Save a connection's socket address without contacting the broker."""
+        try:
+            instance = store()
+            current = instance.get(connection_id)
+            updated = instance.save(replace(current, endpoint=payload.model_dump()))
+            return {"status": "ok", "connection": updated.to_dict()}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get(
+        "/api/connections/{connection_id}/accounts",
+        dependencies=[Depends(require_auth)],
+    )
+    def list_connection_accounts(connection_id: str):
+        """List the broker accounts a connection's login can reach."""
+        try:
+            connection = store().get(connection_id)
+            accounts = connection_accounts(connection)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except AccountListUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {
+            "status": "ok",
+            "connection_id": connection.id,
+            "account_ref": connection.account_ref,
+            "accounts": accounts,
+        }
+
+    @app.put(
+        "/api/connections/{connection_id}/account",
+        dependencies=[Depends(require_settings_write_auth)],
+    )
+    def select_connection_account(connection_id: str, payload: AccountSelectionRequest):
+        """Scope a connection's reads to one account from the broker's own list."""
+        account_ref = payload.account_ref.strip()
+        try:
+            instance = store()
+            connection = instance.get(connection_id)
+            if account_ref:
+                choose_account(connection_accounts(connection), account_ref)
+            updated = instance.select_account(connection.id, account_ref)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except AccountListUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"status": "ok", "connection": updated.to_dict()}
 
     @app.post(
         "/api/connections/{connection_id}/credentials",
@@ -165,8 +240,13 @@ def register_connection_routes(app: FastAPI) -> None:
         try:
             selected = {source.connection_id for source in PortfolioSettingsStore().load().sources}
             if connection_id.strip().lower() in selected:
-                raise ValueError("remove this connection from the portfolio before deleting it")
+                raise HTTPException(status_code=400, detail={
+                    "code": "connection_in_use",
+                    "message": "remove this connection from the portfolio before deleting it",
+                })
             store().delete(connection_id)
             return {"status": "ok", "deleted": connection_id}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc

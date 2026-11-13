@@ -20,7 +20,7 @@ import math
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 
@@ -37,7 +37,9 @@ from src.factors.registry import (
     SkipAlpha,
     get_default_registry,
 )
-from src.tools.alpha_bench_tool import _compute_forward_returns, _load_universe_panel
+from src.factors.data_availability import build_availability_contract
+from src.factors.research_contract import build_bench_research_contract
+from src.tools.alpha_bench_tool import _MAX_HORIZON, _compute_forward_returns, _load_universe_panel, _prepare_bench_panel, _split_alphas_by_universe_support, _validate_bench_data_requirements
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +78,8 @@ def _compute_single_alpha(args: Any) -> dict[str, Any]:
     try:
         factor_df = reg.compute(alpha_id, panel)
         ic = compute_ic_series(factor_df, return_df)
-        if ic.empty:
-            return {"skip": {"id": alpha_id, "reason": "empty IC series", "kind": "typed"}}
+        if len(ic) < 2:
+            return {"skip": {"id": alpha_id, "reason": "insufficient IC observations (need at least 2)", "kind": "typed"}}
         ic_mean = float(ic.mean())
         ic_std = float(ic.std())
         ir = ic_mean / ic_std if ic_std > 0 else 0.0
@@ -108,7 +110,12 @@ def t_stat(ic_mean: float, ic_std: float, n: int) -> float:
 
 
 def categorise(row: dict[str, Any]) -> str:
-    """Bucket a per-alpha row into alive / reversed / dead."""
+    """Bucket a per-alpha row into alive / reversed / dead.
+
+    Thresholds are calibrated on daily next-bar ICs; at horizon h > 1 the
+    |IC| > 0.02 floor is a looser bar (h-bar ICs are naturally larger in
+    magnitude). The run envelope states its own horizon.
+    """
     ic_mean = row["ic_mean"]
     pos = row["ic_positive_ratio"]
     t = t_stat(ic_mean, row["ic_std"], row["ic_count"])
@@ -142,6 +149,12 @@ def run_bench(
     on_progress: ProgressCb | None = None,
     registry: Registry | None = None,
     only: Iterable[str] | None = None,
+    on_stage: Callable[[str], None] | None = None,
+    horizon: int = 1,
+    research_mode: str = "explore",
+    research_stage: str = "single_factor_evaluation",
+    research_lineage: Iterable[str | Mapping[str, Any]] | None = None,
+    research_transformations: Iterable[str | Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run a bench end-to-end and return the API-shaped summary.
 
@@ -160,11 +173,25 @@ def run_bench(
             alpha list is restricted to this set — used by ``alpha compare`` to
             bench just a handful of named alphas instead of the whole zoo. Ids
             not registered under ``zoo`` are silently dropped from the subset.
+        horizon: Forward-return horizon in bars (default 1 = next-bar,
+            unchanged behaviour). ``h > 1`` computes h-bar forward returns
+            sampled non-overlapping (end-anchored) so the naive-iid t-stat
+            stays honest; 21 ≈ monthly, the conventional horizon for
+            fundamental factors.
+        research_mode: Declared evidence mode for the additive research
+            contract (``explore``, ``strict`` or ``locked``). It is metadata
+            only in this version and does not change the bench math.
+        research_stage: Stage name recorded in the research contract.
+        research_lineage: Optional structured inputs for future artifact
+            lineage. Strings are accepted as a compact form.
+        research_transformations: Optional transformations applied before the
+            bench, such as neutralization or factor combination.
 
     Returns:
         Dict with keys: ``status``, ``zoo``, ``universe``, ``period``,
-        ``n_alphas_tested``, ``n_skipped``, ``alive``, ``reversed``, ``dead``,
-        ``by_theme``, ``top5_by_ir``, ``dead_examples``, ``wall_seconds`` —
+        ``horizon``, ``forward_return_sampling``, ``n_alphas_tested``,
+        ``n_skipped``, ``alive``, ``reversed``, ``dead``, ``by_theme``,
+        ``top5_by_ir``, ``dead_examples``, ``wall_seconds`` —
         and on failure: ``status="error"``, ``error``.
     """
     start = time.monotonic()
@@ -173,7 +200,23 @@ def run_bench(
         "zoo": zoo,
         "universe": universe,
         "period": period,
+        "horizon": horizon,
+        "forward_return_sampling": (
+            "non_overlapping"
+            if isinstance(horizon, int) and not isinstance(horizon, bool) and horizon > 1
+            else "daily"
+        ),
     }
+
+    # Fail fast before any panel load (network): same 1.._MAX_HORIZON contract
+    # the tool and MCP wrapper enforce.
+    if isinstance(horizon, bool) or not isinstance(horizon, int) or not 1 <= horizon <= _MAX_HORIZON:
+        entry["status"] = "error"
+        entry["error"] = (
+            f"horizon must be an integer between 1 and {_MAX_HORIZON}, got {horizon!r}"
+        )
+        entry["wall_seconds"] = round(time.monotonic() - start, 2)
+        return entry
 
     reg = registry if registry is not None else get_default_registry()
     alpha_ids = reg.list(zoo=zoo)
@@ -192,7 +235,29 @@ def run_bench(
             entry["wall_seconds"] = round(time.monotonic() - start, 2)
             return entry
 
+    alpha_ids, universe_excluded = _split_alphas_by_universe_support(reg, alpha_ids, universe)
+    if universe_excluded:
+        entry["universe_excluded"] = universe_excluded
+        logger.info(
+            "bench: %d alpha(s) excluded on %s — fund:* inputs need SEC US filings (sp500): %s",
+            len(universe_excluded),
+            universe,
+            ", ".join(universe_excluded[:10]),
+        )
+    if not alpha_ids:
+        entry["status"] = "error"
+        entry["error"] = (
+            f"all {len(universe_excluded)} selected alphas require SEC US filings "
+            f"(fund:* inputs); the {universe!r} universe cannot serve them. "
+            "Choose the S&P 500 universe."
+        )
+        entry["wall_seconds"] = round(time.monotonic() - start, 2)
+        return entry
+
     try:
+        _validate_bench_data_requirements(reg, alpha_ids, universe)
+        if on_stage:
+            on_stage("loading_data")
         panel = _load_universe_panel(universe, period)
     except (ValueError, NotImplementedError, RuntimeError) as exc:
         entry["status"] = "error"
@@ -201,7 +266,10 @@ def run_bench(
         return entry
 
     try:
-        return_df = _compute_forward_returns(panel)
+        panel = _prepare_bench_panel(reg, alpha_ids, panel, universe, period)
+        if on_stage:
+            on_stage("preparing_returns")
+        return_df = _compute_forward_returns(panel, horizon=horizon)
     except Exception as exc:  # noqa: BLE001
         entry["status"] = "error"
         entry["error"] = f"forward returns failed: {exc}"
@@ -211,6 +279,8 @@ def run_bench(
     rows: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     n_total = len(alpha_ids)
+    if on_stage:
+        on_stage("computing")
 
     try:
         n_workers = get_env_config().agent_tuning.vibe_trading_bench_workers or os.cpu_count() or 1
@@ -268,9 +338,9 @@ def run_bench(
             try:
                 factor_df = reg.compute(aid, panel)
                 ic = compute_ic_series(factor_df, return_df)
-                if ic.empty:
+                if len(ic) < 2:
                     skipped.append(
-                        {"id": aid, "reason": "empty IC series", "kind": "typed"}
+                        {"id": aid, "reason": "insufficient IC observations (need at least 2)", "kind": "typed"}
                     )
                 else:
                     ic_mean = float(ic.mean())
@@ -337,6 +407,32 @@ def run_bench(
                 universe_meta = dict(universe_meta_raw)
         except Exception:  # noqa: BLE001
             universe_meta = {"raw": str(universe_meta_raw)}
+
+    required_fields = sorted(
+        {
+            str(column)
+            for aid in alpha_ids
+            for column in (reg.get(aid).meta or {}).get("columns_required", [])
+        }
+    )
+    universe_meta["data_availability"] = build_availability_contract(
+        panel,
+        universe=universe,
+        period=period,
+        required_fields=required_fields,
+    )
+    universe_meta["research"] = build_bench_research_contract(
+        mode=research_mode,
+        stage=research_stage,
+        universe=universe,
+        period=period,
+        factor_ids=alpha_ids,
+        zoo=zoo,
+        lineage=research_lineage,
+        transformations=research_transformations,
+        horizon=horizon,
+        method="rank_ic",
+    )
 
     # Multiple-testing correction. `n_alphas_tested` has always been carried
     # here and has only ever been displayed; the best IR out of hundreds of

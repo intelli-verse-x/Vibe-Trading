@@ -3,10 +3,10 @@ import { useTranslation } from "react-i18next";
 import { Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
+import { useAnalysisState } from "@/hooks/useAnalysisState";
 import {
   bidAskSpreadPct,
   expirationLabel,
-  nearestStrikeIndex,
   type OptionsChainData,
   type OptionsContractRow,
 } from "@/lib/options";
@@ -37,11 +37,17 @@ interface WingTableProps {
   title: string;
   rows: OptionsContractRow[];
   atmStrike: number | null;
+  showAll?: boolean;
 }
 
-function WingTable({ title, rows, atmStrike }: WingTableProps) {
+function WingTable({ title, rows, atmStrike, showAll }: WingTableProps) {
   const { t } = useTranslation();
-  const sorted = useMemo(() => [...rows].sort((a, b) => a.strike - b.strike), [rows]);
+  const sorted = useMemo(() => {
+    const nearby = !showAll && atmStrike !== null
+      ? [...rows].sort((a, b) => Math.abs(a.strike - atmStrike) - Math.abs(b.strike - atmStrike)).slice(0, 15)
+      : rows;
+    return [...nearby].sort((a, b) => a.strike - b.strike);
+  }, [rows, atmStrike, showAll]);
 
   const headers = [
     t("options.chain.strike"),
@@ -130,21 +136,20 @@ function SkeletonRows() {
   );
 }
 
-interface Props {
-  /** Entry spot from the builder — anchors the ATM highlight when available. */
-  referenceSpot?: number;
-}
-
-export function OptionsChainTable({ referenceSpot }: Props) {
+export function OptionsChainTable() {
   const { t } = useTranslation();
-  const [tickerInput, setTickerInput] = useState(DEFAULT_TICKER);
-  const [data, setData] = useState<OptionsChainData | null>(null);
+  const [draft, setDraft] = useAnalysisState("options-chain", { tickerInput: DEFAULT_TICKER, data: null as OptionsChainData | null, fetchedAt: "", showAll: false });
+  const { tickerInput, data, fetchedAt, showAll } = draft;
+  const setTickerInput = (tickerInput: string) => setDraft((d) => ({ ...d, tickerInput }));
+  const setData = (data: OptionsChainData | null) => setDraft((d) => ({ ...d, data, fetchedAt: data ? new Date().toISOString() : "" }));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const generation = useRef(0);
+  const lastRequest = useRef<{ ticker: string; expiration?: number }>({ ticker: DEFAULT_TICKER });
 
   const load = useCallback(async (ticker: string, expiration?: number) => {
     const gen = ++generation.current;
+    lastRequest.current = { ticker, expiration };
     setLoading(true);
     setError(null);
     try {
@@ -166,8 +171,13 @@ export function OptionsChainTable({ referenceSpot }: Props) {
   }, [t]);
 
   useEffect(() => {
-    void load(DEFAULT_TICKER);
-  }, [load]);
+    if (!data) void load(tickerInput.trim().toUpperCase() || DEFAULT_TICKER);
+    return () => { generation.current += 1; };
+    // Own the initial request for the mounted lifetime. Translation changes
+    // must not invalidate an in-flight refresh; unmount still rejects it.
+    // A restored chain is explicitly refreshed by its load button.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -176,16 +186,8 @@ export function OptionsChainTable({ referenceSpot }: Props) {
     void load(ticker);
   };
 
-  const atmStrike = useMemo(() => {
-    if (!data) return null;
-    const rows = data.calls.length > 0 ? data.calls : data.puts;
-    if (rows.length === 0) return null;
-    const anchor =
-      referenceSpot !== undefined && Number.isFinite(referenceSpot) && referenceSpot > 0
-        ? referenceSpot
-        : [...rows].sort((a, b) => a.strike - b.strike)[Math.floor(rows.length / 2)].strike;
-    return rows[nearestStrikeIndex(rows, anchor)].strike;
-  }, [data, referenceSpot]);
+  const atmStrike = data?.atm_strike != null && Number.isFinite(data.atm_strike)
+    && data.atm_strike > 0 ? data.atm_strike : null;
 
   return (
     <section className="rounded-xl border border-border/60 bg-card p-4 shadow-sm">
@@ -226,6 +228,12 @@ export function OptionsChainTable({ referenceSpot }: Props) {
         </form>
       </div>
 
+      {data && <div className="mb-3 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+        <span>{t("analysis.chainQuote", { ticker: data.ticker, price: fmt(data.underlying_price ?? null) })}</span>
+        <span>{t("analysis.lastFetched", { time: fetchedAt ? new Date(fetchedAt).toLocaleString() : "–" })}</span>
+        {atmStrike !== null && <button type="button" className="text-primary underline" onClick={() => setDraft((d) => ({ ...d, showAll: !d.showAll }))}>{t(showAll ? "analysis.nearAtm" : "analysis.allStrikes")}</button>}
+      </div>}
+
       {error && (
         <div className="mb-3 flex items-center justify-between gap-3 rounded border border-danger/30 bg-danger/5 p-3 text-sm text-danger">
           <span>
@@ -233,7 +241,7 @@ export function OptionsChainTable({ referenceSpot }: Props) {
           </span>
           <button
             type="button"
-            onClick={() => void load(data?.ticker ?? tickerInput.trim().toUpperCase() ?? DEFAULT_TICKER, data?.expiration)}
+            onClick={() => void load(lastRequest.current.ticker, lastRequest.current.expiration)}
             className="shrink-0 rounded border border-danger/40 px-2.5 py-1 text-xs font-medium transition-colors hover:bg-danger/10"
           >
             {t("options.chain.retry")}
@@ -255,10 +263,10 @@ export function OptionsChainTable({ referenceSpot }: Props) {
         ) : (
           <div className="flex flex-col gap-5">
             {data.calls.length > 0 && (
-              <WingTable title={t("options.chain.calls")} rows={data.calls} atmStrike={atmStrike} />
+              <WingTable title={t("options.chain.calls")} rows={data.calls} atmStrike={atmStrike} showAll={showAll} />
             )}
             {data.puts.length > 0 && (
-              <WingTable title={t("options.chain.puts")} rows={data.puts} atmStrike={atmStrike} />
+              <WingTable title={t("options.chain.puts")} rows={data.puts} atmStrike={atmStrike} showAll={showAll} />
             )}
           </div>
         )

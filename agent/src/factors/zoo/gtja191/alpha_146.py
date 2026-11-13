@@ -39,13 +39,13 @@ ALPHA_ID = "gtja191_146"
 __alpha_meta__ = {
     'id': 'gtja191_146',
     'theme': ['momentum'],
-    'formula_latex': 'see body',
+    'formula_latex': 'MEAN((CLOSE-DELAY(CLOSE,1))/DELAY(CLOSE,1)-SMA(...,61,2),20)*((CLOSE-DELAY(CLOSE,1))/DELAY(CLOSE,1)-SMA(...,61,2))/SMA(((...)-SMA(...))^2,60,2)',
     'columns_required': ['close'],
     'extras_required': [],
     'universe': ['equity_cn'],
     'frequency': ['1d'],
     'decay_horizon': 60,
-    'min_warmup_bars': 81,
+    'min_warmup_bars': 21,
     'notes': 'Standardised return deviation; SMA(.,61,2)=ewm(alpha=2/61).',
 }
 

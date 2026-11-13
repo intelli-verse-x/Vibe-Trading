@@ -10,6 +10,24 @@ on:
   # verdict on main short of pushing an empty commit.
   workflow_dispatch:
 
+# `npm ci` runs a security audit after installing and blocks on the response.
+# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
+# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
+# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
+# machine, one lock file, one warm cache:
+#
+#   npm ci                                    61s
+#   npm ci --no-audit --no-fund                4s
+#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
+#
+# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
+# the endpoint returns no advisories at all right now, and Dependabot already
+# watches this same tree — it is what reported the 7 open npm alerts. This is CI
+# only; a developer's `npm ci` still audits when the endpoint recovers.
+env:
+  NPM_CONFIG_AUDIT: "false"
+  NPM_CONFIG_FUND: "false"
+
 jobs:
   hash-lock:
     name: Hash lock / ${{ matrix.name }}
@@ -33,8 +51,8 @@ jobs:
       # actions/checkout v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      # actions/setup-python v7.1.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.11"
           architecture: ${{ matrix.architecture }}
@@ -52,7 +70,14 @@ jobs:
   test:
     name: test / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 10 minutes stopped fitting again after the frontend split below: on
+    # 2026-09-29 the 3.11 leg's pytest step took 520s of a job that finished
+    # at exactly 600s (run 36553260060), and the next push was cancelled at
+    # 99% of the suite with no failing test (36556726032). The suite, not a
+    # hang, fills the budget, and runner speed varies by minutes (the same
+    # tree's 3.14 leg took 5m14s one run and 8m32s the other), so the limit
+    # leaves room for that instead of being trimmed to the last good run.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -66,7 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -77,21 +102,23 @@ jobs:
         # OpenBB Workspace bridge would report green while never being exercised.
         # `stats` is included for the same reason: the quantlib econometrics
         # tests skip without statsmodels/arch, and skipped is not tested.
-        run: pip install -e ".[dev,openbb,stats]"
+        run: pip install -e ".[dev,openbb,stats,anthropic,matrix]"
 
       - name: Verify optional extras under test are importable
         # Fails loudly if an extra stops resolving, instead of letting its
         # suite silently degrade to skips.
         run: |
+          python -c "import nio; from src.channels.matrix import MatrixChannel"
           python -c "import openbb_ai, importlib.metadata as m; print('openbb-ai', m.version('openbb-ai'))"
           python -c "import statsmodels; print('statsmodels', statsmodels.__version__)"
           python -c "import arch; print('arch', arch.__version__)"
+          python -c "import langchain_anthropic; print('langchain-anthropic', langchain_anthropic.__version__)"
 
       - name: Repository safety gates
         run: bash tools/ci_grep_gates.sh
 
-      - name: Test environment variable gate
-        run: pytest tools/test_ci_env_var_gate.py -q
+      - name: Test repository safety gates
+        run: pytest tools/test_ci_env_var_gate.py tools/test_ci_private_files_gate.py -q
 
       - name: Syntax check
         run: |
@@ -109,7 +136,23 @@ jobs:
         # the suite never silently switches state on env presence.
         run: pytest --ignore=agent/tests/e2e_backtest --ignore=agent/tests/test_e2e_harness_v2.py --cov=agent --cov-report=term-missing --cov-report=xml --tb=short -q
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Split out of `test` on 2026-09-04. It used to be the tail of BOTH Python
+    # matrix legs, which ran the identical npm ci + tsc + vite + vitest twice
+    # per push for a tree that has no Python in it. That duplication was free
+    # until the Python 3.11 leg grew to 539s of its 600s budget: on 8555a05a an
+    # npm registry slowdown pushed `npm ci` from its usual ~20s to over 130s and
+    # the leg hit `timeout-minutes` mid-install, reporting as `cancelled` with a
+    # green backend. Nothing here is tested less than before — the same three
+    # commands run on the same tree — but the frontend now owns its own budget
+    # and the Python legs get ~65s of headroom back.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           cache: npm
@@ -145,15 +188,17 @@ jobs:
       # actions/checkout v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      # actions/setup-python v7.1.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.14"
           architecture: ${{ matrix.architecture }}
           cache: pip
 
       - name: Install focused test dependencies
-        run: python -m pip install pytest pydantic pyyaml python-dotenv
+        # The private paper-strategy worker imports the actual daily engine.
+        # Exercise its blocked-stdio regression on native x64 and ARM64 too.
+        run: python -m pip install pytest pydantic pyyaml python-dotenv numpy pandas defusedxml requests
 
       - name: Run Windows background safety regressions
         env:
@@ -162,6 +207,22 @@ jobs:
           python -m pytest
           agent/tests/test_background_tools.py
           agent/tests/test_bash_tool.py
+          agent/tests/test_paper_trade_process_transport.py
+          -q
+
+
+      - name: Run scoped cancellation and restart recovery on native Windows
+        env:
+          PYTHONPATH: agent
+        run: >-
+          python -m pytest
+          agent/tests/test_background_host_lifecycle.py::test_cancel_all_reaps_only_its_owner
+          agent/tests/test_background_host_lifecycle.py::test_shutdown_closes_all_handles_and_reaps
+          agent/tests/test_background_host_lifecycle.py::test_cancellation_during_spawn_is_reaped
+          agent/tests/test_background_host_lifecycle.py::test_cancel_before_spawn_never_starts_command
+          agent/tests/test_background_host_lifecycle.py::test_completion_callback_keeps_originating_attempt
+          agent/tests/test_background_store_recovery.py::TestRecoveryIsConservative
+          agent/tests/test_background_store_recovery.py::test_cancel_intent_is_persisted_before_reaping
           -q
 
   desktop-electron-windows:
@@ -173,15 +234,15 @@ jobs:
       # actions/checkout v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      # actions/setup-python v7.1.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
           architecture: x64
           cache: pip
 
-      # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      # actions/setup-node v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "22"
           cache: npm

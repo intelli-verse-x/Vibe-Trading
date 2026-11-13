@@ -10,6 +10,9 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
+from src.agent.grounding.ledger import GroundingLedger
 from src.trading import profiles as trading_profiles
 from src.trading import service as trading_service
 from src.tools import symbol_search_tool as ss
@@ -140,6 +143,18 @@ class TestSymbolSearchSuccess:
         # Unmappable Eastmoney market dropped; empty Yahoo symbol dropped.
         assert "BK0001" not in by_symbol
         assert data["count"] == len(data["candidates"])
+
+    def test_argentina_candidate_keeps_market_identity(self):
+        quote = {
+            "symbol": "GGAL.BA",
+            "shortname": "Grupo Financiero Galicia",
+            "exchange": "BUE",
+            "quoteType": "EQUITY",
+        }
+        candidate = ss._yahoo_candidate(quote)
+        assert candidate is not None
+        assert candidate["symbol"] == "GGAL.BA"
+        assert candidate["market"] == "ar"
 
     def test_limit_clamped_and_applied(self):
         with patch.object(
@@ -794,6 +809,102 @@ class TestFxPairAlignment:
         assert ss._canonical_crypto_pair("BTC/USDT") == "BTC-USDT"
         assert ss._canonical_crypto_pair("BTCUSDT") == "BTC-USDT"
 
+    @pytest.mark.parametrize("query", ["XAUUSD", "XAU/USD", "XAUUSD=X", "XAUUSD.FX"])
+    def test_selected_mt5_profile_resolves_broker_confirmed_metal(
+        self, monkeypatch, tmp_path, query: str
+    ) -> None:
+        monkeypatch.setattr(
+            trading_profiles, "load_selected_profile_id", lambda: "mt5-paper-sdk"
+        )
+        monkeypatch.setattr(
+            trading_service,
+            "search_instruments",
+            lambda query, profile_id, *, limit: {
+                "status": "ok",
+                "instruments": [
+                    {
+                        "symbol": "XAUUSD",
+                        "native_symbol": "XAUUSDm",
+                        "market": "mt5",
+                        "type": "cfd",
+                        "exchange": "Exness-MT5Trial8",
+                    }
+                ],
+            },
+        )
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(
+            ss.yahoo_client,
+            "search",
+            return_value=[
+                {
+                    "symbol": "XAUUSD=X",
+                    "shortname": "Gold",
+                    "exchange": "CCY",
+                    "quoteType": "CURRENCY",
+                }
+            ],
+        ):
+            result = ss.SymbolSearchTool().execute(query=query)
+        data = json.loads(result)["data"]
+
+        assert data["sources"]["mt5"] == "ok"
+        assert data["count"] == 1
+        candidate = data["candidates"][0]
+        assert candidate["symbol"] == query.upper()
+        assert candidate["native_symbol"] == "XAUUSDm"
+        assert candidate["venue"] == "Exness-MT5Trial8"
+        assert candidate["profile_id"] == "mt5-paper-sdk"
+
+        ledger = GroundingLedger(run_dir=tmp_path, user_message=f"Quote {query}")
+        ledger.ingest_tool_result(
+            tool_name="search_symbol",
+            arguments={"query": query},
+            result=result,
+            call_id="resolve-mt5-symbol",
+            success=True,
+        )
+        assert ledger.identity_status == "locked"
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {"status": "ok", "instruments": []},
+            {"status": "error", "error": "terminal unavailable", "instruments": []},
+        ],
+    )
+    def test_mt5_no_match_does_not_create_candidate(
+        self, monkeypatch, response: dict
+    ) -> None:
+        monkeypatch.setattr(
+            trading_profiles, "load_selected_profile_id", lambda: "mt5-paper-sdk"
+        )
+        monkeypatch.setattr(
+            trading_service, "search_instruments", lambda *args, **kwargs: response
+        )
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(
+            ss.yahoo_client,
+            "search",
+            return_value=[
+                {
+                    "symbol": "XAUUSD=X",
+                    "shortname": "Gold",
+                    "exchange": "CCY",
+                    "quoteType": "CURRENCY",
+                }
+            ],
+        ):
+            data = json.loads(ss.SymbolSearchTool().execute(query="XAUUSD"))["data"]
+
+        assert data["candidates"] == []
+
     def test_fx_query_returns_canonical_candidate_when_yahoo_unavailable(self) -> None:
         """A throttled/failed Yahoo must not turn a canonical pair into nothing."""
         with patch.object(
@@ -828,3 +939,371 @@ class TestFxPairAlignment:
             "^FTSE",
             "index",
         )
+
+
+class TestBareUsEtfResolution:
+    """US-listed ETFs and funds resolve like equities, not as ``global``.
+
+    Yahoo carries US ETFs bare (``QQQ``, ``SPY``) while the fetch layer already
+    routes a bare ticker as ``us_equity`` and expects ``<SYM>.US``. The resolver
+    used to emit the bare symbol under market ``global``, so the two layers
+    disagreed and the identity lock rejected every ETF call (#2084).
+    """
+
+    @pytest.mark.parametrize(
+        ("yahoo_symbol", "quote"),
+        [
+            ("QQQ", {"quoteType": "ETF", "exchange": "NGM"}),
+            ("SPY", {"quoteType": "ETF", "exchange": "PCX"}),
+            ("VFIAX", {"quoteType": "MUTUALFUND", "exchange": "NAS"}),
+            # OTC Bulletin Board listings are US listings too.
+            ("ABCD", {"quoteType": "ETF", "exchange": "OBB"}),
+            # Search payloads do not always carry an exchange row.
+            ("QQQ", {"quoteType": "ETF"}),
+        ],
+    )
+    def test_bare_us_fund_gets_us_suffix(self, yahoo_symbol, quote) -> None:
+        assert ss._from_yahoo_symbol(yahoo_symbol, quote) == (
+            f"{yahoo_symbol}.US",
+            "us",
+        )
+
+    def test_bare_fund_on_foreign_venue_stays_native(self) -> None:
+        """A bare symbol Yahoo files under a non-US venue keeps its own form."""
+        assert ss._from_yahoo_symbol(
+            "XIC", {"quoteType": "ETF", "exchange": "TOR"}
+        ) == ("XIC", "global")
+
+    def test_bare_equity_on_foreign_venue_is_not_us(self) -> None:
+        """A bare non-US equity must not be relabelled as a US listing.
+
+        Before the exchange guard, every bare ``EQUITY`` became ``<SYM>.US``,
+        so ``RY`` (Toronto) was published as a US ticker.
+        """
+        assert ss._from_yahoo_symbol(
+            "RY", {"quoteType": "EQUITY", "exchange": "TOR"}
+        ) == ("RY", "global")
+
+    def test_crypto_and_index_unchanged(self) -> None:
+        assert ss._from_yahoo_symbol(
+            "BTC-USD", {"quoteType": "CRYPTOCURRENCY"}
+        ) == ("BTC-USD", "global")
+        assert ss._from_yahoo_symbol("^SPX", {"quoteType": "INDEX"}) == (
+            "^SPX",
+            "index",
+        )
+
+    def test_us_etf_candidate_row_is_fetchable(self) -> None:
+        """End to end: ``QQQ`` surfaces as ``QQQ.US`` / ``us``."""
+        quotes = [
+            {
+                "symbol": "QQQ",
+                "shortname": "Invesco QQQ Trust",
+                "exchange": "NGM",
+                "exchDisp": "NASDAQ",
+                "quoteType": "ETF",
+            }
+        ]
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(ss.yahoo_client, "search", return_value=quotes), patch.object(
+            ss.sec_edgar_client, "cik_for", return_value=None
+        ):
+            data = json.loads(ss.SymbolSearchTool().execute(query="QQQ"))["data"]
+
+        row = next(c for c in data["candidates"] if c["symbol"] == "QQQ.US")
+        assert row["market"] == "us"
+
+
+class TestCryptoUsdBaseWhitelist:
+    """``USD`` quote leg on the crypto resolver is gated on a base whitelist.
+
+    Without this guard, ``XAUUSD`` / ``EURUSD`` / ``GBPUSD`` would all be
+    classified as crypto pairs and the public-venue catalog (Binance/OKX)
+    fallback would either lock onto a tokenized gold token (XAUT/PAXG) or
+    find nothing — never on real spot gold. The fix: only accept ``USD`` on
+    crypto when the base is in :data:`_CRYPTO_USD_BASES`.
+    """
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            # Genuine crypto pairs - must keep working.
+            "BTC-USD",
+            "ETH-USD",
+            "SOL-USD",
+            "BNB-USD",
+            "XLM-USD",
+            "XRP-USD",
+            # Stablecoin-quoted pairs (existing behaviour preserved).
+            "BTC-USDT",
+            "XAUT-USDT",
+            "PAXG-USDT",
+            "ETH-USDC",
+        ],
+    )
+    def test_crypto_pairs_with_supported_base_accepted(self, code):
+        assert ss._canonical_crypto_pair(code) is not None
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            # The reported bug: a spot gold query must NOT resolve to a
+            # crypto pair, or the public-venue catalog fallback will lock a
+            # tokenized-gold row (XAUT-USDT) as the answer.
+            "XAUUSD",
+            "XAU-USD",
+            "XAU/USD",
+            # Forex pairs in 6-letter, dashed, or slashed form.
+            "EURUSD",
+            "EUR-USD",
+            "EUR/USD",
+            "GBPUSD",
+            "GBP-USD",
+            "JPYUSD",
+        ],
+    )
+    def test_non_crypto_bases_with_usd_quote_rejected(self, code):
+        """The ``USD`` leg on non-crypto bases must NOT pass as a crypto pair."""
+        assert ss._canonical_crypto_pair(code) is None
+
+    def test_tokenized_gold_bases_still_resolve_as_crypto(self):
+        # XAUT/PAXG ARE crypto (tokenized gold on Binance/OKX spot) and
+        # must keep resolving as crypto. The whitelist includes them.
+        assert ss._canonical_crypto_pair("XAUT-USDT") == "XAUT-USDT"
+        assert ss._canonical_crypto_pair("PAXG-USDT") == "PAXG-USDT"
+        assert ss._canonical_crypto_pair("XAUT-USD") == "XAUT-USD"
+        assert ss._canonical_crypto_pair("PAXG-USD") == "PAXG-USD"
+
+    def test_xauusd_and_xautusdt_are_not_equivalent_assets(self):
+        # Identity correctness: the resolver must treat XAUUSD (spot gold)
+        # and XAUT-USDT (tokenized gold) as different instruments. If both
+        # return the same canonical string, downstream lock/identity
+        # collision is possible.
+        spot = ss._canonical_crypto_pair("XAUUSD")
+        tokenized = ss._canonical_crypto_pair("XAUT-USDT")
+        assert spot is None
+        assert tokenized == "XAUT-USDT"
+        assert spot != tokenized
+
+    def test_usd_whitelist_is_a_strict_subset_of_crypto_bases(self):
+        # Defensive: the whitelist is what stops non-crypto bases from
+        # slipping through the ``USD`` branch. Every base in it must
+        # therefore actually be tradable on Binance or OKX spot.
+        # This is a coarse sanity check on the whitelist contents; if a
+        # new entry is added in error, this test will still pass (it only
+        # checks the union is non-empty and is a subset of the quote-asset
+        # alphabet).
+        assert ss._CRYPTO_USD_BASES
+        for base in ss._CRYPTO_USD_BASES:
+            assert base.isalpha()
+            assert base.isupper()
+
+class TestSpotGoldCandidateFilter:
+    """Bare gold / FX / futures queries must not lock a wrong crypto identity.
+
+    Yahoo's free-text search can return a near-string crypto pair for a
+    non-crypto query (``XAUUSD`` -> ``VALOUR-BTC-0-SEK.ST`` is a real-world
+    observation). The resolver-side ``_canonical_crypto_pair`` already
+    rejects those candidates, but the symbol-search tool itself used
+    to keep them in the candidate list, propagating the wrong instrument
+    to the identity gate. The fix: when the query is a ticker shape
+    (separator, ``=F``, or ``=X``) but NOT a crypto pair, drop any
+    candidate whose canonical form IS a crypto pair. Free-text name
+    queries (``apple``, ``tesla``) are unaffected.
+    """
+
+    def _run(self, query, yahoo_hits, eastmoney_rows=None):
+        # Default to an empty Eastmoney payload so the test isolates the
+        # Yahoo branch (the layer under test).
+        tool = ss.SymbolSearchTool()
+        em_payload = {"QuotationCodeTable": {"Data": eastmoney_rows or []}}
+        with patch.object(
+            ss.eastmoney_client, "get_json", return_value=em_payload
+        ), patch.object(ss.yahoo_client, "search", return_value=yahoo_hits), \
+             patch.object(ss, "_load_public_markets", return_value={}), \
+             patch.object(ss, "_enrich_us_cik", side_effect=lambda c, s="ok": (c, s)), \
+             patch.object(
+                 trading_profiles, "load_selected_profile_id",
+                 side_effect=OSError("no connector"),
+             ):
+            out = tool.execute(query=query, limit=10)
+        return json.loads(out)
+
+    def test_xauusdt_drops_near_string_btc_etp(self):
+        """The bug repro: Yahoo returns a Swedish Bitcoin ETP for XAUUSD."""
+        yahoo = [
+            {"symbol": "VALOUR-BTC-0-SEK.ST",
+             "shortname": "Valour Bitcoin Zero SEK",
+             "exchange": "STO", "quoteType": "EQUITY", "index": "XETR"},
+        ]
+        data = self._run("XAUUSD", yahoo)["data"]
+        assert data["count"] == 0
+        assert data["candidates"] == []
+
+    def test_xauusd_slash_drops_near_string_crypto_hits(self):
+        yahoo = [
+            {"symbol": "AETHUSDT-USD", "shortname": "Aave Ethereum USDT",
+             "exchange": "CCC", "quoteType": "CRYPTOCURRENCY", "index": "AETH"},
+        ]
+        data = self._run("XAU/USD", yahoo)["data"]
+        assert data["count"] == 0
+
+    def test_xauusd_x_drops_near_string_crypto_hits(self):
+        yahoo = [
+            {"symbol": "AETHUSDT-USD", "shortname": "Aave Ethereum USDT",
+             "exchange": "CCC", "quoteType": "CRYPTOCURRENCY", "index": "AETH"},
+        ]
+        data = self._run("XAUUSD=X", yahoo)["data"]
+        assert data["count"] == 0
+
+    def test_gold_query_keeps_the_real_gold_candidate(self):
+        """The filter must not be one-way: the right instrument survives.
+
+        Every other case here asserts a rejection, and a filter that dropped
+        everything would pass all of them. These assert the opposite
+        direction, across spellings — a candidate written ``XAUUSD=X`` or
+        ``XAU/USD`` is the same instrument as the query and must be kept.
+        """
+        yahoo = [
+            {"symbol": "XAUUSD=X", "shortname": "XAU/USD",
+             "exchange": "CCY", "quoteType": "CURRENCY", "index": "XAUUSD"},
+        ]
+        for query in ("XAUUSD", "XAU/USD", "XAU-USD", "XAUUSD=X"):
+            data = self._run(query, yahoo)["data"]
+            assert [c["symbol"] for c in data["candidates"]] == ["XAUUSD=X"], query
+
+    def test_fx_query_keeps_its_pair_across_spellings(self):
+        yahoo = [
+            {"symbol": "EURUSD=X", "shortname": "EUR/USD",
+             "exchange": "CCY", "quoteType": "CURRENCY", "index": "EURUSD"},
+        ]
+        for query in ("EURUSD", "EUR/USD", "EURUSD=X"):
+            data = self._run(query, yahoo)["data"]
+            assert [c["symbol"] for c in data["candidates"]] == ["EURUSD=X"], query
+
+    def test_gc_f_keeps_correct_futures_hit(self):
+        yahoo = [
+            {"symbol": "GC=F", "shortname": "Gold Continuous Front Month",
+             "exchange": "NYM", "quoteType": "FUTURE", "index": "GC"},
+        ]
+        data = self._run("GC=F", yahoo)["data"]
+        assert data["count"] == 1
+        assert data["candidates"][0]["symbol"] == "GC=F"
+
+    def test_xaut_usdt_keeps_tokenized_gold(self):
+        yahoo = [
+            {"symbol": "XAUT-USDT", "shortname": "Tether Gold",
+             "exchange": "CCC", "quoteType": "CRYPTOCURRENCY", "index": "XAUT"},
+        ]
+        data = self._run("XAUT-USDT", yahoo)["data"]
+        assert data["count"] == 1
+        assert data["candidates"][0]["symbol"] == "XAUT-USDT"
+
+    def test_paxg_usdt_keeps_tokenized_gold(self):
+        yahoo = [
+            {"symbol": "PAXG-USDT", "shortname": "Paxos Gold",
+             "exchange": "CCC", "quoteType": "CRYPTOCURRENCY", "index": "PAXG"},
+        ]
+        data = self._run("PAXG-USDT", yahoo)["data"]
+        assert data["count"] == 1
+        assert data["candidates"][0]["symbol"] == "PAXG-USDT"
+
+    def test_free_text_name_query_unaffected(self):
+        """A free-text company name (``apple``) is NOT a ticker shape and
+        must not have crypto candidates stripped. Yahoo's free-text
+        answer may include near-string crypto hits (``BTC-USD``) which
+        the user is allowed to see and choose from.
+        """
+        yahoo = [
+            {"symbol": "BTC-USD", "shortname": "Bitcoin USD",
+             "exchange": "CCC", "quoteType": "CRYPTOCURRENCY", "index": "BTC"},
+            {"symbol": "AAPL.US", "shortname": "Apple Inc.",
+             "exchange": "NMS", "quoteType": "EQUITY", "index": "AAPL"},
+        ]
+        data = self._run("apple", yahoo)["data"]
+        symbols = [c["symbol"] for c in data["candidates"]]
+        assert "BTC-USD" in symbols
+        assert "AAPL.US" in symbols
+
+
+@pytest.mark.parametrize("query", ["XAUUSDm", "EURUSDm", "US500.cash"])
+def test_selected_mt5_native_symbol_uses_only_terminal(monkeypatch, query):
+    monkeypatch.setattr(trading_profiles, "load_selected_profile_id", lambda: "mt5-paper-sdk")
+    monkeypatch.setattr(trading_service, "search_instruments", lambda *args, **kwargs: {
+        "status": "ok", "instruments": [{"symbol": query, "native_symbol": query, "market": "mt5", "type": "cfd"}]
+    })
+    def forbidden(*args, **kwargs):
+        raise AssertionError("MT5 identity must not use web search")
+    monkeypatch.setattr(ss, "_search_eastmoney", forbidden)
+    monkeypatch.setattr(ss, "_search_yahoo", forbidden)
+    data = json.loads(ss.SymbolSearchTool().execute(query=query))["data"]
+    assert data["count"] == 1
+    assert data["candidates"][0]["symbol"] == query
+    assert data["candidates"][0]["market"] == "mt5"
+
+
+def test_mt5_ambiguous_native_rows_are_not_deduplicated_into_identity(monkeypatch):
+    monkeypatch.setattr(trading_profiles, "load_selected_profile_id", lambda: "mt5-paper-sdk")
+    monkeypatch.setattr(trading_service, "search_instruments", lambda *args, **kwargs: {
+        "status": "ok", "instruments": [{"native_symbol": name} for name in ("XAUUSDm", "XAUUSDz")]
+    })
+    data = json.loads(ss.SymbolSearchTool().execute(query="XAUUSD"))["data"]
+    assert data["candidates"] == []
+    assert "ambiguous" in data["sources"]["mt5"]
+
+
+@pytest.mark.parametrize("query,native,market,kind", [
+    ("XAUUSDm", "XAUUSDm", "mt5", "cfd"),
+    ("EURUSDm", "EURUSDm", "fx", "forex"),
+    ("XAUUSD.FX", "XAUUSDm", "mt5", "cfd"),
+    ("EURUSD.FX", "EURUSDm", "fx", "forex"),
+])
+def test_mt5_selected_identity_reaches_grounding_without_substitution(monkeypatch, tmp_path, query, native, market, kind):
+    monkeypatch.setattr(trading_profiles, "load_selected_profile_id", lambda: "mt5-paper-sdk")
+    monkeypatch.setattr(trading_service, "search_instruments", lambda *args, **kwargs: {
+        "status": "ok", "instruments": [{"symbol": native, "native_symbol": native, "market": market, "type": kind, "venue": "MT5"}]
+    })
+    result = ss.SymbolSearchTool().execute(query=query)
+    ledger = GroundingLedger(run_dir=tmp_path, user_message=f"Quote {query}")
+    ledger.ingest_tool_result(tool_name="search_symbol", arguments={"query": query}, result=result, call_id="mt5-identity", success=True)
+    assert json.loads(result)["data"]["candidates"][0]["native_symbol"] == native
+    assert ledger.identity_status == "locked"
+    records = [record for record in ledger.identity_summary()["records"]
+               if record["source_tool_call_id"] == "mt5-identity"]
+    assert len(records) == 1
+    assert records[0]["instrument_type"] == kind
+    assert records[0]["symbol"] == query.upper()
+
+
+def test_mt5_ambiguous_catalog_leaves_grounding_unresolved(monkeypatch, tmp_path):
+    monkeypatch.setattr(trading_profiles, "load_selected_profile_id", lambda: "mt5-paper-sdk")
+    monkeypatch.setattr(trading_service, "search_instruments", lambda *args, **kwargs: {
+        "status": "ok", "instruments": [{"native_symbol": name} for name in ("XAUUSDm", "XAUUSDz")]
+    })
+    result = ss.SymbolSearchTool().execute(query="XAUUSD")
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="Quote XAUUSD")
+    ledger.ingest_tool_result(tool_name="search_symbol", arguments={"query": "XAUUSD"}, result=result, call_id="ambiguous-mt5", success=True)
+    assert ledger.identity_status != "locked"
+    assert ledger.identity_summary()["authorized_symbols"] == []
+
+
+@pytest.mark.parametrize(
+    "quote_id, expected",
+    [
+        ("0.920002", "920002.BJ"),
+        ("0.830799", "830799.BJ"),
+        ("0.430139", "430139.BJ"),
+        ("0.000001", "000001.SZ"),
+        ("0.300750", "300750.SZ"),
+        ("1.600519", "600519.SH"),
+    ],
+)
+def test_eastmoney_market_zero_splits_beijing_from_shenzhen(quote_id: str, expected: str) -> None:
+    code = quote_id.split(".", 1)[1]
+    row = {"QuoteID": quote_id, "Code": code, "Name": "x", "SecurityTypeName": "A"}
+    candidate = ss._eastmoney_candidate(row)
+    assert candidate is not None
+    assert candidate["symbol"] == expected

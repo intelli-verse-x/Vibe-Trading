@@ -6,15 +6,15 @@ Zero API key required for HK/US/crypto research markets (yfinance, OKX,
 AKShare are free). Trading connector tools are profile-scoped and require the
 selected connector's own local app or OAuth setup.
 
-Surfaces 74 tools: skills, research goals, strategy discovery,
+Surfaces 81 tools: skills, research goals, strategy discovery,
 backtest/factor/options/pattern
-analysis, market data, fundamentals & capital-flow & news & discovery
-(get_fund_flow / get_dragon_tiger / get_northbound_flow / get_margin_trading /
+analysis, deterministic paper-trading matching (paper_trade_step), market data, fundamentals & capital-flow & news & discovery
+(get_fund_flow / get_dragon_tiger / get_northbound_flow / get_southbound_flow /
+get_margin_trading /
 get_block_trades / get_shareholder_count / get_lockup_expiry / get_sector_info /
 get_research_reports / get_stock_news / get_sec_filings /
 get_financial_statements / get_options_chain / get_stock_profile /
-screen_market / search_symbol / get_macro_series / iwencai_search /
-qveris_search / qveris_inspect / qveris_execute),
+screen_market / search_symbol / get_macro_series / iwencai_search),
 institutional-research and alternative data (get_institutional_holdings /
 etf_holdings / prediction_market / research_papers), read-only finance math and
 market analytics (quantlib_call / cashflow_performance / orderbook_depth /
@@ -23,9 +23,7 @@ trading-connector reads, swarm orchestration, trade-journal and shadow-account
 analysis. Every exposed tool is read-only or research-only except
 refresh_strategy_evidence, which writes ONLY the disposable facade-owned
 strategy-evidence cache from local run artifacts; no order-placing or
-order-cancelling tool is ever surfaced via MCP. The QVeris tools additionally
-require QVeris paid routing (QVERIS_API_KEY + paid mode), and qveris_execute
-is billable research-data execution only — it never places orders.
+order-cancelling tool is ever surfaced via MCP.
 
 Usage:
     python mcp_server.py                    # stdio transport (default)
@@ -72,6 +70,8 @@ if str(AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_DIR))
 
 from fastmcp import Context, FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import Middleware
 from pydantic import BeforeValidator
 
 from cli._version import __version__ as APP_VERSION
@@ -81,10 +81,38 @@ from src.market_data import (
     detect_source,
     get_loader,
 )
+from src.factors.research_contract import RESEARCH_MODES, RESEARCH_STAGES
 
 mcp = FastMCP("Vibe-Trading", version=APP_VERSION)
 
 logger = logging.getLogger(__name__)
+
+
+class _ToolPolicyMiddleware(Middleware):
+    """Apply the tool deny-list to every MCP tool.
+
+    The registry refuses denied names, but many MCP tools call their code
+    directly; screening here covers those and keeps denied tools out of the
+    advertised list. Like the registry check, a convenience filter, not a
+    security boundary.
+    """
+
+    async def on_list_tools(self, context: Any, call_next: Any) -> Any:
+        from src.providers.tool_policy import _deny_prefixes
+
+        prefixes = _deny_prefixes()
+        return [tool for tool in await call_next(context) if not tool.name.startswith(prefixes)]
+
+    async def on_call_tool(self, context: Any, call_next: Any) -> Any:
+        from src.providers.tool_policy import _deny_prefixes
+
+        name = context.message.name
+        if name.startswith(_deny_prefixes()):
+            raise ToolError(f"{name} is disabled by the active tool policy")
+        return await call_next(context)
+
+
+mcp.add_middleware(_ToolPolicyMiddleware())
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +495,7 @@ _lenient_str_list_opt = Annotated[list[str] | None, _lenient]
 _lenient_float_list_opt = Annotated[list[float] | None, _lenient]
 _lenient_dict_list = Annotated[list[dict[str, Any]], _lenient]
 _lenient_dict_list_opt = Annotated[list[dict[str, Any]] | None, _lenient]
+_lenient_dict_any = Annotated[dict[str, Any], _lenient]
 _lenient_dict_any_opt = Annotated[dict[str, Any] | None, _lenient]
 _lenient_dict_str_str = Annotated[dict[str, str], _lenient]
 
@@ -617,9 +646,9 @@ def get_research_goal(session_id: str = "", ctx: Context | None = None) -> str:
 
 @mcp.tool
 def add_goal_evidence(
-    goal_id: str,
-    expected_goal_id: str,
     text: str,
+    goal_id: str = "",
+    expected_goal_id: str = "",
     session_id: str = "",
     criterion_id: str | None = None,
     claim_id: str | None = None,
@@ -645,9 +674,11 @@ def add_goal_evidence(
     """Append traceable evidence to a finance research goal.
 
     Args:
-        goal_id: Goal being mutated.
-        expected_goal_id: Goal id captured before the tool/model turn started.
         text: Evidence note or result summary.
+        goal_id: Optional goal id. Defaults to the current goal for this
+            session.
+        expected_goal_id: Optional stale-write guard captured before the
+            tool/model turn started. Defaults to goal_id.
         session_id: Optional conversation id. Omit it unless the client tracks
             its own sessions; this server then uses one id per process.
         criterion_id: Optional criterion this evidence satisfies.
@@ -656,7 +687,9 @@ def add_goal_evidence(
         tool_call_id: Source tool call id for traceability; it does not verify evidence by itself.
         run_id: Vibe-Trading run id. It verifies evidence only when the run directory exists.
         source_provider: Data/provider name such as yfinance, OKX, tushare.
+            Defaults to "agent_tool" when omitted.
         source_type: Source category such as market_data, document, backtest.
+            Defaults to "tool_note" when omitted.
         source_uri: Optional source URL/path.
         symbol_universe: Symbols covered by the evidence.
         benchmark: Benchmark symbols covered by the evidence.
@@ -673,10 +706,20 @@ def add_goal_evidence(
     try:
         from src.goal import EvidenceInput, StaleGoalError
 
-        evidence = _get_goal_store().append_evidence(
-            session_id=_resolve_session_id(session_id, ctx),
-            goal_id=goal_id.strip(),
-            expected_goal_id=expected_goal_id.strip(),
+        store = _get_goal_store()
+        resolved_session_id = _resolve_session_id(session_id, ctx)
+        resolved_goal_id = goal_id.strip()
+        if not resolved_goal_id:
+            snapshot = store.get_current_snapshot(resolved_session_id)
+            if snapshot is None:
+                return _json_error("no current goal for this session", error_type="not_found")
+            resolved_goal_id = str(snapshot["goal"]["goal_id"])
+        resolved_expected_goal_id = expected_goal_id.strip() or resolved_goal_id
+
+        evidence = store.append_evidence(
+            session_id=resolved_session_id,
+            goal_id=resolved_goal_id,
+            expected_goal_id=resolved_expected_goal_id,
             evidence=EvidenceInput(
                 criterion_id=_blank_to_none(criterion_id),
                 claim_id=_blank_to_none(claim_id),
@@ -684,8 +727,8 @@ def add_goal_evidence(
                 text=text,
                 tool_call_id=_blank_to_none(tool_call_id),
                 run_id=_blank_to_none(run_id),
-                source_provider=_blank_to_none(source_provider),
-                source_type=_blank_to_none(source_type),
+                source_provider=_blank_to_none(source_provider) or "agent_tool",
+                source_type=_blank_to_none(source_type) or "tool_note",
                 source_uri=_blank_to_none(source_uri),
                 symbol_universe=_clean_list(symbol_universe),
                 benchmark=_clean_list(benchmark),
@@ -700,7 +743,7 @@ def add_goal_evidence(
                 contradicts_claim_ids=_clean_list(contradicts_claim_ids),
             ),
         )
-        snapshot = _get_goal_store().get_goal_snapshot(goal_id.strip())
+        snapshot = store.get_goal_snapshot(resolved_goal_id)
         if snapshot is None:
             return _json_error("Goal snapshot could not be reloaded")
         from dataclasses import asdict
@@ -713,10 +756,40 @@ def add_goal_evidence(
 
 
 @mcp.tool
+def update_research_goal(
+    objective: str | None = None,
+    ui_summary: str | None = None,
+    goal_id: str = "",
+    expected_goal_id: str = "",
+    session_id: str = "",
+    ctx: Context | None = None,
+) -> str:
+    """Edit the current research goal without discarding criteria or evidence.
+
+    Args:
+        objective: Replacement objective; omit to keep the current text.
+        ui_summary: Replacement display summary; omit to keep it.
+        goal_id: Optional current goal id.
+        expected_goal_id: Optional stale-write guard, defaulting to goal_id.
+        session_id: Optional conversation id; defaults to this MCP connection.
+        ctx: MCP request context supplied by the server.
+
+    Returns:
+        Updated snapshot or a structured validation/stale-goal error.
+    """
+    from src.tools.goal_tool import UpdateResearchGoalTool
+
+    return UpdateResearchGoalTool(
+        default_session_id=_resolve_session_id(session_id, ctx), store=_get_goal_store()
+    ).execute(objective=objective, ui_summary=ui_summary, goal_id=goal_id,
+              expected_goal_id=expected_goal_id)
+
+
+@mcp.tool
 def update_research_goal_status(
-    goal_id: str,
-    expected_goal_id: str,
     status: str,
+    goal_id: str = "",
+    expected_goal_id: str = "",
     session_id: str = "",
     audit: _lenient_dict_list_opt = None,
     recap: str | None = None,
@@ -729,9 +802,11 @@ def update_research_goal_status(
     required criterion and verified evidence for satisfied rows.
 
     Args:
-        goal_id: Goal being mutated.
-        expected_goal_id: Goal id captured before the tool/model turn started.
         status: Goal lifecycle status, e.g. complete, cancelled, blocked.
+        goal_id: Optional goal id. Defaults to the current goal for this
+            session.
+        expected_goal_id: Optional stale-write guard captured before the
+            tool/model turn started. Defaults to goal_id.
         session_id: Optional conversation id. Omit it unless the client tracks
             its own sessions; this server then uses one id per process.
         audit: Optional list of criterion audit rows.
@@ -740,15 +815,25 @@ def update_research_goal_status(
     try:
         from src.goal import GoalStatus, StaleGoalError
 
-        updated = _get_goal_store().update_status(
-            session_id=_resolve_session_id(session_id, ctx),
-            goal_id=goal_id.strip(),
-            expected_goal_id=expected_goal_id.strip(),
+        store = _get_goal_store()
+        resolved_session_id = _resolve_session_id(session_id, ctx)
+        resolved_goal_id = goal_id.strip()
+        if not resolved_goal_id:
+            snapshot = store.get_current_snapshot(resolved_session_id)
+            if snapshot is None:
+                return _json_error("no current goal for this session", error_type="not_found")
+            resolved_goal_id = str(snapshot["goal"]["goal_id"])
+        resolved_expected_goal_id = expected_goal_id.strip() or resolved_goal_id
+
+        updated = store.update_status(
+            session_id=resolved_session_id,
+            goal_id=resolved_goal_id,
+            expected_goal_id=resolved_expected_goal_id,
             status=GoalStatus(status),
             audit=_audit_rows_from_payload(audit),
             recap=_blank_to_none(recap),
         )
-        snapshot = _get_goal_store().get_goal_snapshot(updated.goal_id)
+        snapshot = store.get_goal_snapshot(updated.goal_id)
         if snapshot is None:
             return _json_error("Goal snapshot could not be reloaded")
         return _json_ok(goal=snapshot["goal"], snapshot=snapshot)
@@ -780,6 +865,12 @@ def backtest(run_dir: str) -> str:
     - "auto": auto-detect based on symbol format (with fallback)
 
     Returns metrics (Sharpe, return, drawdown, etc.) and artifact paths.
+    On success the envelope also carries a structured ``summary``: the full
+    scalar metrics plus structured_metrics and validation, run metadata,
+    an ``equity_preview`` (at most 50 equal-stride points, first and last
+    pinned) and ``artifact_paths`` including per-symbol ohlcv files — read
+    these instead of parsing ``stdout``. Large envelopes omit logs first
+    and reduce preview points; any omitted summary is explicitly reported.
 
     Args:
         run_dir: Path to the run directory containing config.json and code/.
@@ -787,6 +878,114 @@ def backtest(run_dir: str) -> str:
     from src.tools.backtest_tool import run_backtest
 
     return run_backtest(run_dir)
+
+
+# ---------------------------------------------------------------------------
+# Paper-trading step tool (pt-v1.1/pt-v1.2/pt-v1.3, VD-12 hand-written wrapper)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def paper_trade_step(
+    account_id: str,
+    market: str,
+    account_state: _lenient_dict_any,
+    from_date: str,
+    to_date: str,
+    orders: _lenient_dict_list_opt = None,
+    strategy_path: str | None = None,
+    fee_model: _lenient_dict_any_opt = None,
+    interval: str | None = None,
+    session: str | None = None,
+    path_model: str | None = None,
+    fill_model: str | None = None,
+    order_volume_ratio: float | None = None,
+) -> str:
+    """Run one step of the deterministic paper-trading matching engine; never places real orders.
+
+    Matches the injected ``orders`` (or, in Step 7, a ``strategy_path``'s
+    per-day orders) against bars under the market's frozen rules (T+1, price
+    limits, board lots, fees) and returns ONE in-band JSON document on
+    ``result.content[0].text``: the pt-v1.1/pt-v1.2/pt-v1.3 success result, or an AM-5
+    error envelope (``PAPER_DATA_NOT_READY`` retryable / ``INVALID_REQUEST``
+    non-retryable) on the SAME channel — never a transport error. Research-only:
+    it reads market data and the injected ledger, matches on paper, and writes
+    nothing; no broker or trading-connector order path exists here.
+
+    Args:
+        account_id: Account identifier, echoed verbatim in the result.
+        market: One of ``cn_a`` / ``hk`` / ``us`` — selects the frozen rule set.
+        account_state: RM-injected ledger snapshot ``{cash, positions:[{symbol,
+            qty, avg_cost}]}``. Hashed raw for ``received_state_hash``.
+        from_date: Inclusive range start ``YYYY-MM-DD``. Orders mode requires
+            ``from_date == to_date`` (single day); multi-day ranges are
+            strategy_path mode only.
+        to_date: Inclusive range end ``YYYY-MM-DD`` (the target trading day).
+        orders: Orders mode — array of ``{symbol, side, qty, limit?}``. Exactly
+            one of ``orders`` / ``strategy_path`` must be given; an empty array
+            is the zero-order pure-valuation path.
+        strategy_path: Strategy mode — path to an AST-hardened strategy whose
+            per-day orders are matched. Exactly one of ``orders`` /
+            ``strategy_path``.
+        fee_model: Optional per-key fee overrides merged over the market
+            defaults (AM-4-3: RM always injects it explicitly).
+        interval: Optional pt-v1.2 bar interval — ``1d`` (default) or ``5m``;
+            ``5m`` is cn_a-only.
+        session: Optional pt-v1.2 session selector — ``auto`` (default) or
+            ``cn_a``; ``cn_a`` requires market ``cn_a``.
+        path_model: Optional pt-v1.2 reference-price model — ``bar_median``
+            (default) or ``bar_close``; ignored for ``1d``.
+        fill_model: Optional fill model — ``all_or_none`` (default) or
+            ``volume_share`` (pt-v1.3; requires ``interval='5m'`` and cn_a).
+        order_volume_ratio: Optional pt-v1.3 per-order share of available
+            volume, ``0 < r <= 1``; only with ``fill_model='volume_share'``.
+            Omitted means 1.0.
+    """
+    from src.tools.paper_trade.tool import run_paper_trade_step
+
+    payload: dict[str, Any] = {
+        "account_id": account_id,
+        "market": market,
+        "account_state": account_state,
+        "from_date": from_date,
+        "to_date": to_date,
+    }
+    if orders is not None:
+        payload["orders"] = orders
+    if strategy_path is not None:
+        payload["strategy_path"] = strategy_path
+    if fee_model is not None:
+        payload["fee_model"] = fee_model
+    if interval is not None:
+        payload["interval"] = interval
+    if session is not None:
+        payload["session"] = session
+    if path_model is not None:
+        payload["path_model"] = path_model
+    if fill_model is not None:
+        payload["fill_model"] = fill_model
+    if order_volume_ratio is not None:
+        payload["order_volume_ratio"] = order_volume_ratio
+    return run_paper_trade_step(payload)
+
+
+@mcp.tool
+def paper_trade_reconcile(account_state: _lenient_dict_any, result: _lenient_dict_any) -> str:
+    """Independently reconcile a paper-trading result without market or broker access.
+
+    Replays the supplied fills from the initial ledger and checks fees, cash,
+    positions, cn_a T+1 availability, end_state and NAV arithmetic. The report
+    distinguishes verified ledger facts from market-value and hash checks that
+    the result alone cannot establish. Research only; no orders are placed.
+
+    Args:
+        account_state: Initial ``{cash, positions}`` ledger supplied to the step.
+        result: Successful ``paper_trade_step`` document to audit.
+    """
+    registry = _get_registry()
+    return registry.execute(
+        "paper_trade_reconcile", {"account_state": account_state, "result": result}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -863,7 +1062,10 @@ def alpha_bench(
     alpha_id: str | None = None,
     zoo: str | None = None,
     top: int = 20,
+    horizon: int = 1,
     output_dir: str | None = None,
+    research_stage: str = "single_factor_evaluation",
+    research_mode: str = "explore",
 ) -> str:
     """Benchmark one Alpha Zoo alpha or a complete zoo on a universe.
 
@@ -873,7 +1075,13 @@ def alpha_bench(
         alpha_id: Optional single alpha id; mutually exclusive with ``zoo``.
         zoo: Optional zoo id; mutually exclusive with ``alpha_id``.
         top: Number of top-ranked alphas to include in the report.
+        horizon: Forward-return horizon in bars (default 1 = next-bar).
+            ``h > 1`` computes h-bar forward returns and samples IC rows
+            non-overlapping (end-anchored); 21 ≈ monthly, the conventional
+            horizon for fundamental factors. Range 1-252.
         output_dir: Optional directory for the generated HTML report.
+        research_stage: Stage recorded in the factor-research contract.
+        research_mode: Declared mode; metadata only, not locked-evaluation enforcement.
     """
     if not alpha_id and not zoo:
         return json.dumps(
@@ -895,7 +1103,7 @@ def alpha_bench(
     try:
         from datetime import date
 
-        from src.tools.alpha_bench_tool import _parse_period
+        from src.tools.alpha_bench_tool import _MAX_HORIZON, _parse_period
 
         start_raw, end_raw = _parse_period(period)
         start_date = date.fromisoformat(start_raw)
@@ -924,15 +1132,40 @@ def alpha_bench(
             ensure_ascii=False,
         )
 
+    if isinstance(horizon, bool) or not isinstance(horizon, int) or not 1 <= horizon <= _MAX_HORIZON:
+        return json.dumps(
+            {
+                "status": "error",
+                "error": f"MCP alpha_bench horizon must be an integer between 1 and {_MAX_HORIZON}",
+            },
+            ensure_ascii=False,
+        )
+
+    if research_stage not in RESEARCH_STAGES or research_mode not in RESEARCH_MODES:
+        return json.dumps(
+            {
+                "status": "error",
+                "error": "MCP alpha_bench research_stage or research_mode is not supported",
+            },
+            ensure_ascii=False,
+        )
+
     params: dict[str, Any] = {
         "universe": universe,
         "period": period,
         "top": top,
+        "horizon": horizon,
     }
     if alpha_id is not None:
         params["alpha_id"] = alpha_id
     if zoo is not None:
         params["zoo"] = zoo
+    # Keep the legacy wire payload byte-for-byte stable when callers use the
+    # default stage; newer clients can opt into the additive research contract.
+    if research_stage != "single_factor_evaluation":
+        params["research_stage"] = research_stage
+    if research_mode != "explore":
+        params["research_mode"] = research_mode
 
     if output_dir:
         from src.config.paths import get_runtime_root
@@ -1116,7 +1349,7 @@ def read_document(file_path: str) -> str:
 
 @mcp.tool
 def web_search(query: str, max_results: int = 5) -> str:
-    """Search the web via DuckDuckGo and return top results.
+    """Search the web with configured providers and free search engines.
 
     Returns titles, URLs, and snippets. Use read_url() to fetch full content
     from any result URL. Free, no API key required.
@@ -1162,6 +1395,86 @@ def read_file(path: str) -> str:
     """
     registry = _get_registry()
     return registry.execute("read_file", {"path": path})
+
+
+@mcp.tool
+def read_run_artifact(
+    run_dir: str,
+    artifact: str,
+    format: str = "rows",
+    offset: int = 0,
+    max_rows: int = 1000,
+    columns: _lenient_str_list_opt = None,
+) -> str:
+    """Read a backtest run artifact as structured JSON instead of raw CSV text.
+
+    Artifacts: friendly aliases ``equity``, ``trades``, ``metrics``,
+    ``positions``, ``target_positions`` (CSVs under ``<run_dir>/artifacts/``),
+    ``ohlcv:<CODE>`` (e.g. ``ohlcv:600519.SH``) and ``run_card`` — plus any
+    run_dir-relative ``.csv``/``.json`` path listed in the run's
+    ``run_card.json`` artifacts manifest (e.g. ``artifacts/validation.json``).
+    The manifest is the trust anchor: a relative path it does not list is
+    refused, and a manifest entry pointing outside the run directory is never
+    followed.
+
+    Formats:
+
+    - ``rows``: offset paging over whole records; follow ``next_offset`` until
+      ``truncated`` is false to walk a file losslessly.
+    - ``downsample``: equal-stride sample of at most ``max_rows`` points with
+      the first and last row always pinned — one call feeds a chart.
+    - ``meta``: columns / total_rows / size_bytes, plus the manifest's
+      ``sha256`` and ``manifest_size_bytes`` for a manifest-listed artifact.
+
+    Cells arrive typed (int / float / null / string). Every envelope is
+    serialized within the shared model-result character budget: an oversized
+    page shrinks to whole records with honest ``truncated`` / ``next_offset``
+    metadata rather than cutting mid-JSON. Errors return
+    ``{"ok": false, "error", "hint"}``. Small JSON artifacts return their
+    parsed object; oversized JSON returns size metadata in meta mode and an
+    actionable error otherwise.
+
+    Args:
+        run_dir: Run directory a backtest/tool call returned.
+        artifact: Alias name or manifest-listed relative path (see above);
+            anything else — including path traversal — is refused.
+        format: "rows" (default), "downsample" or "meta".
+        offset: First row index for "rows" mode (default 0).
+        max_rows: Page size [1, 5000] (default 1000); samples retain at least two endpoints.
+        columns: Optional column projection; unknown names are refused with
+            the valid list.
+    """
+    registry = _get_registry()
+    return registry.execute(
+        "read_run_artifact",
+        {
+            "run_dir": run_dir,
+            "artifact": artifact,
+            "format": format,
+            "offset": offset,
+            "max_rows": max_rows,
+            "columns": columns,
+        },
+    )
+
+
+@mcp.tool
+def list_backtest_runs(scope: str = "all", run_id: str = "", limit: int = 5, offset: int = 0) -> str:
+    """List earlier backtest runs (newest first, paged) so their artifacts can be read, not re-run.
+
+    Each run carries the absolute ``run_dir`` of its backtests for ``read_run_artifact``.
+    Without an active session, ``scope="session"`` also lists every run.
+
+    Args:
+        scope: "all" (default) or "session".
+        run_id: Only this bare run directory name.
+        limit: Runs per page [1, 20] (default 5).
+        offset: Runs to skip; use ``next_offset`` from the previous page.
+    """
+    registry = _get_registry()
+    return registry.execute(
+        "list_backtest_runs", {"scope": scope, "run_id": run_id or None, "limit": limit, "offset": offset}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1289,7 +1602,21 @@ def get_strategy_evidence(strategy_id: str, regime: str | None = None) -> str:
 
 
 @mcp.tool
-def refresh_strategy_evidence(manifest_path: str | None = None, runs: list | None = None) -> str:
+def adapt_strategy(strategy_id: str, name: str, universe: str, config: dict, position_sizing: str | None = None) -> str:
+    """Prepare a child from fresh adequate SDM evidence, preserving signal logic.
+
+    Returns description and a bound run_dir. Load strategy-generate, write the
+    child's code, backtest there, then refresh its evidence with scope=strategies.
+    Does not generate code or run a backtest by itself, or copy parent metrics.
+    """
+    return _strategy_discovery_execute("adapt_strategy", {
+        "strategy_id": strategy_id, "name": name, "universe": universe,
+        "config": config, "position_sizing": position_sizing,
+    })
+
+
+@mcp.tool
+def refresh_strategy_evidence(manifest_path: str | None = None, runs: list | None = None, scope: str = "all") -> str:
     """Rebuild the strategy-discovery evidence cache from backtest run artifacts.
 
     WRITE tool with disposable-cache-only scope: it replaces the facade-owned
@@ -1311,10 +1638,11 @@ def refresh_strategy_evidence(manifest_path: str | None = None, runs: list | Non
     Args:
         manifest_path: Path to the JSON manifest file (see above).
         runs: Inline run specs (see above).
+        scope: all replaces the whole cache; strategies updates successful named strategies only.
     """
     return _strategy_discovery_execute(
         "refresh_strategy_evidence",
-        {"manifest_path": manifest_path, "runs": runs},
+        {"manifest_path": manifest_path, "runs": runs, "scope": scope},
     )
 
 
@@ -1775,6 +2103,7 @@ def get_market_data(
     - "akshare": A-shares, US, HK, futures, forex (free, e.g. 000001.SZ, AAPL.US)
     - "ccxt": crypto from 100+ exchanges (free, e.g. BTC/USDT)
     - "mt5": forex/metals from a local MetaTrader 5 terminal (Windows; e.g. EUR/USD, XAUUSD.FX)
+    - "gildata": only on user request, with token and market quotes enabled; no fallback
     - "auto": auto-detect based on symbol format (with fallback)
 
     Args:
@@ -1783,7 +2112,7 @@ def get_market_data(
         end_date: End date (YYYY-MM-DD).
         source: Data source. Prefer ``auto``; ``yahoo``/``yfinance`` serve
             Canada, US, and HK equities.
-        interval: Bar size (1m/5m/15m/30m/1H/4H/1D, default "1D").
+        interval: Bar size (1m/5m/15m/30m/1H/4H/1D/1W/1M, default "1D"; 1W and 1M are built from daily bars).
         max_rows: Per-symbol row cap (default 250) so the response stays
             within the MCP token budget. A symbol exceeding it returns an
             even-stride downsample (every step-th bar, last bar pinned)
@@ -1799,8 +2128,11 @@ def get_market_data(
     Price caliber: which source served a symbol decides what its prices mean
     (some adjust for splits and dividends, others serve raw quotes). Each
     symbol's ``_provenance.adjustment`` states the caliber ("raw" / "split" /
-    "split_dividend" / "na" / "unknown") — read it before comparing price
-    levels across symbols.
+    "split_dividend" / "split_dividend_additive" / "na" / "unknown") — read it
+    before comparing price levels across symbols. Note that
+    ``split_dividend_additive`` (the A-share qfq of Tencent, Eastmoney and AKShare) adjusts dividends by
+    shifting the price level rather than scaling it, so it is not on the same
+    scale as ``split_dividend`` even though both account for dividends.
     """
     registry = _get_registry()
     return registry.execute(
@@ -1827,12 +2159,11 @@ def get_market_data(
 # Each wrapper delegates to the auto-discovered local registry, exactly like
 # factor_analysis / pattern_recognition above. The registry returns a clean
 # JSON error envelope when a key-gated tool (get_macro_series needs
-# FRED_API_KEY, iwencai_search needs VIBE_TRADING_IWENCAI_KEY, the qveris_*
-# tools need QVeris paid routing: QVERIS_API_KEY + paid mode) is absent — see
+# FRED_API_KEY, iwencai_search needs VIBE_TRADING_IWENCAI_KEY) is absent — see
 # ``_execute_key_gated`` below, which honours that contract even though the
 # tool is excluded from the registry by ``check_available()``. Every tool below
 # is read-only or research-only data — no order/trading tool is ever surfaced
-# via MCP (qveris_execute spends QVeris credits on data calls, never orders).
+# via MCP.
 # ---------------------------------------------------------------------------
 
 
@@ -1843,7 +2174,6 @@ def get_market_data(
 # contract above (a clean, env-var-named error). For these tools we therefore
 # fall through to the tool's own ``execute()`` — whose missing-key envelope
 # names the exact env var (``FRED_API_KEY`` / ``VIBE_TRADING_IWENCAI_KEY``),
-# or the missing QVeris paid-routing setup (``QVERIS_API_KEY`` + paid mode).
 def _key_gated_tool_classes() -> dict[str, Any]:
     """Return the {tool_name: tool_class} map for key-gated MCP tools.
 
@@ -1854,35 +2184,31 @@ def _key_gated_tool_classes() -> dict[str, Any]:
         Mapping of MCP tool name to its ``BaseTool`` subclass.
     """
     from src.tools.fred_macro_tool import FredMacroTool
-    from src.tools.iwencai_tool import IWenCaiSearchTool
-    from src.tools.qveris_tool import (
-        QVerisExecuteTool,
-        QVerisInspectTool,
-        QVerisSearchTool,
+    from src.tools.fund_nav_tool import GildataFundNavTool
+    from src.tools.gildata_research_tools import (
+        GetCnAnnouncementsTool,
+        GetCnMacroSeriesTool,
+        SearchBrokerReportsTool,
     )
+    from src.tools.iwencai_tool import IWenCaiSearchTool
 
     return {
         "get_macro_series": FredMacroTool,
+        "get_fund_nav": GildataFundNavTool,
+        "get_cn_macro_series": GetCnMacroSeriesTool,
+        "get_cn_announcements": GetCnAnnouncementsTool,
+        "search_broker_reports": SearchBrokerReportsTool,
         "iwencai_search": IWenCaiSearchTool,
-        "qveris_search": QVerisSearchTool,
-        "qveris_inspect": QVerisInspectTool,
-        "qveris_execute": QVerisExecuteTool,
     }
 
 
 def _execute_key_gated(name: str, params: dict[str, Any]) -> str:
     """Run a key-gated MCP tool, preserving its env-var-named error.
 
-    Prefers the auto-discovered registry (present when the API key is set and,
-    for the qveris_* tools, paid mode is on). When the gating is absent the
-    tool is excluded from the registry, so we invoke its concrete ``execute()``
-    directly to surface the documented missing-key error that names the exact
-    env var — or the missing QVeris paid routing — never a generic "Tool not
-    found".
+    If a credential is missing, use the tool's own actionable error response.
 
     Args:
-        name: MCP tool name (``get_macro_series``, ``iwencai_search``,
-            ``qveris_search``, ``qveris_inspect`` or ``qveris_execute``).
+        name: Registered key-gated tool name.
         params: Keyword arguments forwarded to the tool.
 
     Returns:
@@ -1950,6 +2276,26 @@ def get_northbound_flow(lookback_days: int = 30) -> str:
 
 
 @mcp.tool
+def get_southbound_flow(lookback_days: int = 30) -> str:
+    """Fetch Southbound (Stock-Connect) net capital flow into Hong Kong equities.
+
+    Returns the latest trading day's net buy plus recent daily history, split
+    into 港股通（沪） and 港股通（深） channels (units: 100M HKD, 亿) from the
+    Eastmoney datacenter — cross-verified against HKEX official daily
+    statistics — falling back to the HKEX official report (latest trading day
+    snapshot) when Eastmoney is unavailable. Southbound is the only
+    Stock-Connect direction whose daily net buy is still officially disclosed
+    (the northbound net ended 2024-08-30; see get_northbound_flow). Read-only,
+    no credentials; HK market only.
+
+    Args:
+        lookback_days: Trailing trading days of daily net-buy history to return.
+    """
+    registry = _get_registry()
+    return registry.execute("get_southbound_flow", {"lookback_days": lookback_days})
+
+
+@mcp.tool
 def get_margin_trading(code: str, days: int = 30) -> str:
     """Fetch an A-share stock's daily margin-trading (融资融券) balances (Eastmoney).
 
@@ -1984,11 +2330,13 @@ def get_block_trades(code: str, days: int = 30) -> str:
 
 @mcp.tool
 def get_shareholder_count(code: str, max_periods: int = 24) -> str:
-    """Fetch mainland A-share quarterly shareholder count (股东户数) (Eastmoney).
+    """Fetch mainland A-share shareholder count history (股东户数) (Eastmoney).
 
-    Returns holder count per report period, quarter-over-quarter change
-    (absolute and percent), and average holding (shares and market value) per
-    account. Markets: China A-shares only (.SH/.SZ/.BJ).
+    Returns holder count per disclosed period, the change against the previous
+    disclosed period (absolute and percent; each row states its own
+    prev_period_end since intervals vary), and average holding (shares and
+    market value) per account on the newest row. Markets: China A-shares only
+    (.SH/.SZ/.BJ).
 
     Args:
         code: A-share symbol in <code>.<exchange> form (SH/SZ/BJ).
@@ -2252,7 +2600,10 @@ def get_macro_series(
         series_id: FRED series identifier (e.g. "CPIAUCSL", "UNRATE").
         start_date: Inclusive window start, YYYY-MM-DD. Omit for full history.
         end_date: Inclusive window end, YYYY-MM-DD. Omit for the latest date.
-        limit: Maximum number of most-recent observations to return.
+        limit: Maximum number of most-recent observations to return (max
+            5000). A series longer than that is capped and says so in the
+            result: truncated, observations_available, and a hint. The shared
+            character budget may return fewer rows; count reports delivered rows.
     """
     params: dict[str, Any] = {"series_id": series_id, "limit": limit}
     if start_date:
@@ -2260,6 +2611,88 @@ def get_macro_series(
     if end_date:
         params["end_date"] = end_date
     return _execute_key_gated("get_macro_series", params)
+
+@mcp.tool
+def get_fund_nav(
+    funds: _lenient_str_list,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 2000,
+) -> str:
+    """Fetch daily NAV history for Chinese off-exchange funds (场外基金).
+
+    Returns unit NAV (单位净值), accumulated NAV (累计净值), dividend-adjusted
+    NAV (复权净值) and the daily growth rate per fund, over an optional date
+    window. Codes are bare 6-digit ('110022') or '.OF'-suffixed
+    ('110022.OF'). Exchange-listed ETF/LOF are OHLCV instruments — use
+    get_market_data for those. Requires GILDATA_TOKEN and the fund_nav opt-in.
+
+    Args:
+        funds: Fund codes, e.g. ["110022", "000198.OF"].
+        start_date: Inclusive window start, YYYY-MM-DD. Omit for the vendor's
+            default history window.
+        end_date: Inclusive window end, YYYY-MM-DD. Omit through the latest
+            published NAV.
+        limit: Maximum number of most-recent rows per fund.
+    """
+    params: dict[str, Any] = {"funds": funds, "limit": limit}
+    if start_date:
+        params["start_date"] = start_date
+    if end_date:
+        params["end_date"] = end_date
+    return _execute_key_gated("get_fund_nav", params)
+
+
+@mcp.tool
+def get_cn_macro_series(query: str, limit: int = 50) -> str:
+    """Fetch China macro / regional / industry economic indicator series (宏观 EDB).
+
+    GDP, CPI, PPI, PMI, money supply, rates, trade, 31 industry series and
+    regional data — dated observations with unit and frequency, asked for in
+    natural language. Complements get_macro_series (FRED, US/global).
+    Requires GILDATA_TOKEN and the macro_series opt-in.
+
+    Args:
+        query: Natural-language indicator request, e.g. "2024年中国月度CPI同比".
+        limit: Maximum rows returned.
+    """
+    return _execute_key_gated(
+        "get_cn_macro_series", {"query": query, "limit": limit}
+    )
+
+
+@mcp.tool
+def get_cn_announcements(query: str, limit: int = 50) -> str:
+    """Search Chinese-market announcements (公告): A-share, HK and fund filings.
+
+    Annual reports, earnings, dividends, buybacks, restructuring, inquiry
+    letters — with title, publish date and a highlighted excerpt. For US
+    filings use get_sec_filings. Requires GILDATA_TOKEN and the announcements opt-in.
+
+    Args:
+        query: Natural-language announcement request, e.g. "贵州茅台2024年年度分红公告".
+        limit: Maximum rows returned.
+    """
+    return _execute_key_gated(
+        "get_cn_announcements", {"query": query, "limit": limit}
+    )
+
+
+@mcp.tool
+def search_broker_reports(query: str, limit: int = 50) -> str:
+    """Search sell-side broker research (券商研报) over the Juyuan library.
+
+    Title, broker, industry, rating and a highlighted excerpt of the argument
+    — for company deep-dives, industry views and macro commentary. Coexists
+    with get_research_reports (eastmoney-backed). Requires GILDATA_TOKEN and the broker_reports opt-in.
+
+    Args:
+        query: Natural-language research request, e.g. "最近三个月白酒行业的券商研报观点".
+        limit: Maximum rows returned.
+    """
+    return _execute_key_gated(
+        "search_broker_reports", {"query": query, "limit": limit}
+    )
 
 
 @mcp.tool
@@ -2278,100 +2711,6 @@ def iwencai_search(query: str, limit: int = 20) -> str:
         limit: Maximum securities to return.
     """
     return _execute_key_gated("iwencai_search", {"query": query, "limit": limit})
-
-
-@mcp.tool
-def qveris_search(query: str, limit: int = 20, session_id: str | None = None) -> str:
-    """Search the QVeris premium data/tool marketplace for capabilities.
-
-    Discovery is free. Returns candidate tools with ``tool_id``, ``provider``,
-    ``parameters``, ``expected_cost`` and ``stats.success_rate``; choose by
-    expected cost and success rate before any paid execute. Requires QVeris
-    paid routing (``QVERIS_API_KEY`` and paid mode via ``vibe-trading data
-    mode paid`` or Settings -> QVeris) — without it the tool returns a
-    not-available error.
-
-    Args:
-        query: Capability search query, e.g. "US listed options chain implied
-            volatility Greeks AAPL".
-        limit: Maximum candidates to return.
-        session_id: Optional QVeris session id linking follow-up calls.
-    """
-    params: dict[str, Any] = {"query": query, "limit": limit}
-    if session_id:
-        params["session_id"] = session_id
-    return _execute_key_gated("qveris_search", params)
-
-
-@mcp.tool
-def qveris_inspect(
-    tool_ids: list[str],
-    search_id: str | None = None,
-    session_id: str | None = None,
-) -> str:
-    """Inspect full parameter schemas of QVeris tools before executing them.
-
-    Fetches the complete descriptors for one or more ``tool_ids`` returned by
-    ``qveris_search``. Inspection is free: verify required parameters, enum
-    values, date formats and output shape before a paid call. Requires QVeris
-    paid routing (``QVERIS_API_KEY`` and paid mode via ``vibe-trading data
-    mode paid`` or Settings -> QVeris) — without it the tool returns a
-    not-available error.
-
-    Args:
-        tool_ids: QVeris tool ids taken from ``qveris_search`` results.
-        search_id: Optional search id from the ``qveris_search`` response.
-        session_id: Optional QVeris session id linking follow-up calls.
-    """
-    params: dict[str, Any] = {"tool_ids": tool_ids}
-    if search_id:
-        params["search_id"] = search_id
-    if session_id:
-        params["session_id"] = session_id
-    return _execute_key_gated("qveris_inspect", params)
-
-
-@mcp.tool
-def qveris_execute(
-    tool_id: str,
-    parameters: dict[str, Any],
-    search_id: str | None = None,
-    session_id: str | None = None,
-    model: str | None = None,
-    max_response_size: int = 20480,
-) -> str:
-    """Execute one QVeris capability after discovery and inspection.
-
-    Runs the ``tool_id`` selected via ``qveris_search`` / ``qveris_inspect``.
-    MAY BE BILLABLE — provider calls are charged by QVeris when billable
-    (failed or empty calls are not charged), and the tool enforces the local
-    per-session credit budget before sending the request; the result preserves
-    ``cost`` and ``remaining_credits``. Research/data execution only — it
-    never places orders. Requires QVeris paid routing (``QVERIS_API_KEY`` and
-    paid mode via ``vibe-trading data mode paid`` or Settings -> QVeris) —
-    without it the tool returns a not-available error.
-
-    Args:
-        tool_id: QVeris tool id to execute.
-        parameters: Provider call parameters matching the inspected schema.
-        search_id: Optional search id from the ``qveris_search`` response.
-        session_id: Optional QVeris session id used for budget accounting.
-        model: Optional provider model override.
-        max_response_size: Provider response truncation budget (default
-            20480; -1 disables truncation).
-    """
-    params: dict[str, Any] = {
-        "tool_id": tool_id,
-        "parameters": parameters,
-        "max_response_size": max_response_size,
-    }
-    if search_id:
-        params["search_id"] = search_id
-    if session_id:
-        params["session_id"] = session_id
-    if model:
-        params["model"] = model
-    return _execute_key_gated("qveris_execute", params)
 
 
 # ---------------------------------------------------------------------------
@@ -2998,6 +3337,22 @@ def scan_shadow_signals(
 
 
 # ---------------------------------------------------------------------------
+# Research Lab
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def research_lab(action: str, request: dict | None = None) -> str:
+    """Run sealed cost/OOS experiments, factor audits, or offline task replay.
+
+    Args:
+        action: catalog, show, cost_sensitivity, walk_forward, factor_audit, replay.
+        request: Shared Research Lab request; catalog lists available inputs.
+    """
+    return _get_registry().execute("research_lab", {"action": action, "request": request or {}})
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -3026,7 +3381,8 @@ def main():
         action="store_true",
         help="Register bash / background_run / cancel_background (OS process "
         "control — RCE surface). OFF by default for every transport; equivalent "
-        "to setting VIBE_TRADING_ENABLE_SHELL_TOOLS=1.",
+        "to setting VIBE_TRADING_ENABLE_SHELL_TOOLS=1 in the process environment "
+        "(.env is not consulted for this switch).",
     )
     args = parser.parse_args()
 
@@ -3040,6 +3396,11 @@ def main():
         logging.getLogger(__name__).warning("Legacy state migration failed", exc_info=True)
 
     _include_shell_tools = _resolve_include_shell_tools(args.enable_shell_tools)
+    # After the shell-tool decision: that switch must come from the launch
+    # flag or process env, never from a .env written for the web server.
+    from src.providers.llm import _ensure_dotenv
+
+    _ensure_dotenv()
     _registry = None
     _get_registry()  # pre-warm: avoids deadlock when first tools/call lazy-inits inside FastMCP worker thread
 

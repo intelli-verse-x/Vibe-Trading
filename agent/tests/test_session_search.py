@@ -101,10 +101,27 @@ class TestSearch:
     def test_cjk_search(self, index: SessionSearchIndex) -> None:
         index.index_session("s1", "A股分析")
         index.index_message("s1", "user", "上证指数今日走势分析 shanghai composite index")
-        # FTS5 tokenizes by whitespace; CJK single chars may not match.
-        # Search with the ASCII fallback to verify the session is indexed.
         results = index.search("shanghai composite index")
         assert len(results) >= 1
+
+    def test_cjk_search_matches_a_phrase_shorter_than_the_whole_message(
+        self, index: SessionSearchIndex
+    ) -> None:
+        """A CJK query must match without quoting the entire indexed message.
+
+        FTS5's default tokenizer has no CJK word boundaries, so a run of
+        Chinese characters indexes as one token spanning the whole run.
+        Without unigram/bigram preparation, only a query that happens to be
+        that exact full token could ever match -- any realistic phrase or
+        single word came back empty even though the text was indexed.
+        """
+        index.index_session("s1", "A股分析")
+        index.index_message("s1", "user", "我想了解比特币的最新价格走势和交易策略")
+
+        for query in ("比特币", "价格", "交易策略"):
+            results = index.search(query)
+            assert len(results) >= 1, f"query {query!r} found nothing"
+            assert results[0].session_id == "s1"
 
     def test_snippet_contains_match(self, index: SessionSearchIndex) -> None:
         index.index_session("s1", "Snippet test")
@@ -220,3 +237,29 @@ class TestReindex:
         results = index.search("reindex probe")
         assert len(results) >= 1
         assert results[0].session_id == "session-001"
+
+    def test_reindex_keeps_unicode_line_separator_inside_message(self, index: SessionSearchIndex, tmp_path: Path) -> None:
+        import json
+
+        store_dir = tmp_path / "sessions"
+        store_dir.mkdir()
+        s_dir = store_dir / "session-unicode"
+        s_dir.mkdir()
+        (s_dir / "session.json").write_text(
+            json.dumps({
+                "session_id": "session-unicode",
+                "title": "Unicode message",
+                "created_at": "2026-01-01T00:00:00",
+            }),
+            encoding="utf-8",
+        )
+        (s_dir / "messages.jsonl").write_text(
+            json.dumps({"role": "user", "content": "before\u2028searchable\u2029after"}, ensure_ascii=False)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        assert index.reindex_from_store(store_dir) == 1
+        results = index.search("searchable")
+        assert len(results) == 1
+        assert results[0].snippet.replace(">>>", "").replace("<<<", "") == "before\u2028searchable\u2029after"

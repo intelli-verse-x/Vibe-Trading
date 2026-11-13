@@ -79,11 +79,13 @@ class IndiaEquityEngine(BaseEngine):
         """Cash equity trades in 1-share lots."""
         return float(max(int(raw_size), 0))
 
-    def calc_commission(self, size: float, price: float, _direction: int, is_open: bool) -> float:
+    def calc_commission(self, size: float, price: float, direction: int, is_open: bool) -> float:
         """India delivery cost stack (see module docstring).
 
-        ``_direction`` is unused — reserved for future asymmetric long/short
-        (intraday MIS) schedules.
+        Stamp duty and the DP charge follow the actual trade side rather than
+        open/close: with ``allow_short`` an opening short is a sale and its
+        cover is the purchase. ``BaseEngine`` passes the position direction on
+        both hooks, so the side is derivable.
         """
         notional = size * price
         brokerage = notional * self.in_brokerage
@@ -92,7 +94,8 @@ class IndiaEquityEngine(BaseEngine):
         gst = (brokerage + exchange_txn + sebi_fee) * self.in_gst
         stt = notional * self.in_stt                          # bilateral (delivery)
         comm = brokerage + exchange_txn + sebi_fee + gst + stt
-        if is_open:
+        is_buy = (direction > 0) if is_open else (direction < 0)
+        if is_buy:
             comm += notional * self.in_stamp_duty             # stamp duty: buy-only
         else:
             comm += self.in_dp_charge                         # DP charge: sell-only, flat
@@ -137,17 +140,26 @@ def india_can_execute(state, rules, symbol: str, direction: int, bar: pd.Series)
         return False
 
     # 2. T+1: can't sell shares bought today (delivery).
-    if direction == 0:
-        pos = state.positions.get(symbol)
-        if pos is not None:
-            bar_date = _bar_date(bar)
-            entry_date = pos.entry_time.date() if hasattr(pos.entry_time, "date") else None
-            if bar_date is not None and entry_date is not None and bar_date == entry_date:
-                return False
+    pos = state.positions.get(symbol) if direction == 0 else None
+    if pos is not None:
+        bar_date = _bar_date(bar)
+        entry_date = pos.entry_time.date() if hasattr(pos.entry_time, "date") else None
+        if bar_date is not None and entry_date is not None and bar_date == entry_date:
+            return False
 
     # 3. Circuit bands, tested at execution time (see _blocked_by_limit).
+    # position_direction tells _blocked_by_limit which band a close is really
+    # testing: closing a short is a buy, blocked at the upper band, not the
+    # lower band a long-side sell would use. Without it a short-covering buy
+    # locked at the upper circuit (no sellers to buy from) was wrongly let
+    # through, tested against the wrong band with sell-side slippage.
     if rules.price_limit and _blocked_by_limit(
-        state, symbol, direction, bar, float(rules.price_limit)
+        state,
+        symbol,
+        direction,
+        bar,
+        float(rules.price_limit),
+        position_direction=pos.direction if pos is not None else None,
     ):
         return False
 

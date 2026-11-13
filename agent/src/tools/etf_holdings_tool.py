@@ -242,11 +242,12 @@ def _classify_market(symbol: str) -> str:
         symbol: An ETF symbol such as ``"510050.SH"``, ``"510050"`` or ``"IVV"``.
 
     Returns:
-        ``"CN"`` for a ``.SH`` / ``.SZ`` suffix or a bare six-digit code,
+        ``"CN"`` for a ``.SH`` / ``.SZ`` suffix (or Yahoo's ``.SS`` alias for
+        Shanghai) or a bare six-digit code,
         ``"US"`` otherwise.
     """
     upper = symbol.strip().upper()
-    if upper.endswith((".SH", ".SZ")):
+    if upper.endswith((".SH", ".SZ", ".SS")):
         return "CN"
     if len(upper) == 6 and upper.isdigit():
         return "CN"
@@ -286,6 +287,9 @@ def _cn_code_and_secid(symbol: str) -> tuple[str, str | None]:
         be determined.
     """
     upper = symbol.strip().upper()
+    if upper.endswith(".SS"):
+        # Yahoo's spelling of Shanghai; the shared resolver knows ``.SH`` only.
+        upper = f"{upper[: -len('.SS')]}.SH"
     if upper.endswith((".SH", ".SZ")):
         return upper.split(".")[0], resolve_secid(upper)
     exchange = _CN_PREFIX_EXCHANGE.get(upper[:2])
@@ -463,6 +467,23 @@ def _is_etf_class(record: dict[str, Any]) -> bool:
     return "ETF" in f"{record.get('series_name') or ''} {record.get('class_name') or ''}".upper()
 
 
+def _bare_us_ticker(query: str) -> str:
+    """Drop the project's ``.US`` suffix so SEC tickers line up.
+
+    The resolver publishes US listings as ``<SYM>.US`` (see
+    ``symbol_search_tool._from_yahoo_symbol``), while the SEC series/class
+    index stores bare tickers. Without this fold an identical fund looks up as
+    ``QQQ.US`` and is reported as "not a fund share class".
+
+    Args:
+        query: A ticker, optionally carrying the ``.US`` market suffix.
+
+    Returns:
+        The upper-cased ticker with any ``.US`` suffix removed.
+    """
+    return query.strip().upper().removesuffix(".US")
+
+
 def _us_match(query: str, limit: int) -> list[dict[str, Any]]:
     """Find fund share classes by exact ticker, then by name substring.
 
@@ -481,7 +502,7 @@ def _us_match(query: str, limit: int) -> list[dict[str, Any]]:
         ahead of other classes.
     """
     _, records = _us_series_index()
-    needle = query.strip().upper()
+    needle = _bare_us_ticker(query)
     exact = [r for r in records if r["ticker"] == needle]
     if len(exact) >= limit:
         return exact[:limit]
@@ -1359,7 +1380,7 @@ def _holdings_us(symbol: str, top_n: int, offset: int) -> str:
         matches = _us_match(symbol, 1)
     except Exception as exc:  # noqa: BLE001 - surface as envelope
         return _error(f"SEC series/class index lookup failed: {exc}")
-    if not matches or matches[0]["ticker"] != symbol.strip().upper():
+    if not matches or matches[0]["ticker"] != _bare_us_ticker(symbol):
         return _error(
             f"'{symbol}' is not a fund share class in the SEC series/class index. "
             "Note that unit investment trusts (SPY among them) do not appear there "

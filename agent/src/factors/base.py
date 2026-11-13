@@ -6,7 +6,24 @@ contract returns a DataFrame of the same shape — raw scores, NaN preserved
 in warmup / missing data; +/- inf is forbidden (registry rejects it).
 
 NaN policy: every operator propagates NaN; no silent ``fillna(0)``. A constant
-window for ``ts_corr`` / ``ts_cov`` returns NaN, not zero.
+window for ``ts_corr`` / ``ts_cov`` returns NaN, not zero. A missing input is
+never replaced by a constant — not a comparison read as False, not
+``.where(cond, 0)``, not ``np.fmax`` returning the other side (#1463) — and a
+full-window operator (``min_periods`` equal to its window) is NaN on every bar
+whose window holds the gap. The one exception, decided on #1463 (2026-09-18):
+a recursive statistic skips a missing observation and continues from its last
+state — the GTJA ``SMA(A, n, m)`` written as ``.ewm(alpha=m/n, adjust=False)``,
+a running product — and so does a window that declares its own partial
+coverage (``min_periods`` below its length, or a coverage rule in its notes).
+Those emit a value on the bars after a gap, computed from the observations
+they did see. Nothing rewarms them, and nothing should: the registry already
+masks the gap bar itself.
+
+A comparison gate or ``np.fmin`` / ``np.fmax`` over operands that can be
+undefined on complete data (a constant window's correlation) masks on its
+inputs' reach with :func:`observed_over`, not on its operands' NaN: a gap
+inside the reach is NaN, and a correlation that is undefined without any gap
+keeps the verdict it always had (#1452).
 
 Lookahead ban: ``delta(df, d)`` requires ``d >= 1``; the negative-shift
 ``Ref(df, -n)`` form is intentionally absent.
@@ -77,6 +94,75 @@ def zscore(df: pd.DataFrame) -> pd.DataFrame:
     std = df.std(axis=1, ddof=1, skipna=True)
     result = df.sub(mean, axis=0).div(std.where(std > 0), axis=0)
     return result.replace([np.inf, -np.inf], np.nan)
+
+
+def zscore_by_group(df: pd.DataFrame, groups: pd.DataFrame) -> pd.DataFrame:
+    """Per-row within-group z-score (axis=1 groups, sample std, ddof=1).
+
+    The z-scoring sibling of the per-row sector demean the industry-neutralized
+    alpha101 alphas use: instead of one cross-sectional mean/std per date, each
+    label group in the row gets its own. One difference is deliberate — there is
+    NO global fallback. A cell whose group cannot produce a statistic stays NaN
+    rather than silently degrading to a whole-cross-section z-score wearing an
+    industry-neutral label.
+
+    Contract:
+        * ``groups`` is a wide label frame with the SAME shape as ``df``,
+          positionally aligned (same precedent as the alpha101 ``sector`` tag);
+          labels may be any hashable value (str, int) and are compared by
+          position, never by index/column join.
+        * Per row: within each label group, ``(x - group_mean) / group_std``
+          with ``ddof=1`` over the group's finite observations.
+        * A group with fewer than two finite observations on that row → NaN for
+          that group's cells (no statistic exists); a zero-variance group → NaN
+          (never inf, never silent zero).
+        * NaN input cells stay NaN; cells whose label is None/NaN → NaN; ±inf
+          inputs are scrubbed to NaN before grouping.
+        * Output keeps ``df``'s shape, index and columns exactly.
+
+    Args:
+        df: Wide numeric frame (dates x symbols).
+        groups: Wide label frame, same shape as ``df``, positionally aligned.
+
+    Returns:
+        Wide frame of within-group z-scores, NaN wherever the contract above
+        refuses to produce a number.
+
+    Raises:
+        ValueError: If ``groups`` does not have the same shape as ``df``.
+    """
+    if df.shape != groups.shape:
+        raise ValueError(
+            f"zscore_by_group: groups shape {groups.shape} != df shape {df.shape}; "
+            "the label frame must be positionally aligned with the value frame"
+        )
+    values = _as_float(df).to_numpy(dtype=np.float64, na_value=np.nan).copy()
+    # ±inf is not an observation: scrub before it poisons a group mean/std.
+    values[~np.isnan(values) & ~np.isfinite(values)] = np.nan
+    labels = groups.to_numpy()
+    # Per-row python/numpy loop, same mechanics as the alpha101 precedent —
+    # correctness over cleverness; cross-sections are a few hundred cells wide.
+    for i in range(values.shape[0]):
+        row = values[i]
+        label_row = labels[i]
+        unlabeled = pd.isna(label_row)
+        if unlabeled.any():
+            row[unlabeled] = np.nan
+        for tag in pd.unique(label_row):
+            if tag is None or (isinstance(tag, float) and np.isnan(tag)) or pd.isna(tag):
+                continue  # handled by the unlabeled mask above
+            mask = label_row == tag
+            vals = row[mask]
+            finite = vals[~np.isnan(vals)]
+            if finite.size < 2:
+                row[mask] = np.nan
+                continue
+            std = finite.std(ddof=1)
+            if not np.isfinite(std) or std <= 0:
+                row[mask] = np.nan
+                continue
+            row[mask] = (vals - finite.mean()) / std
+    return pd.DataFrame(values, index=df.index, columns=df.columns)
 
 
 def scale(df: pd.DataFrame, a: float = 1.0) -> pd.DataFrame:
@@ -190,6 +276,31 @@ def ts_std(df: pd.DataFrame, n: int) -> pd.DataFrame:
     return df.rolling(window=n, min_periods=n).std(ddof=1)
 
 
+def ts_slope(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Rolling OLS slope against ``0, ..., n - 1``, requiring a full window."""
+    if n < 2:
+        raise ValueError(f"ts_slope window must be >= 2, got {n}")
+    arr = _as_float(df).to_numpy(dtype=np.float64, na_value=np.nan)
+    T, C = arr.shape
+    result = np.full((T, C), np.nan)
+    if T < n:
+        return pd.DataFrame(result, index=df.index, columns=df.columns)
+
+    x = np.arange(n, dtype=np.float64)
+    x -= x.mean()
+    windows = sliding_window_view(arr, window_shape=n, axis=0)
+    slopes = np.einsum("ijk,k->ij", windows, x) / np.dot(x, x)
+    result[n - 1 :] = slopes
+    return pd.DataFrame(result, index=df.index, columns=df.columns)
+
+
+def ts_resi(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Latest observation's residual from the same trailing OLS fit."""
+    slope = ts_slope(df, n)
+    fitted_at_last = ts_mean(df, n) + slope * ((n - 1) / 2.0)
+    return df - fitted_at_last
+
+
 def ts_max(df: pd.DataFrame, n: int) -> pd.DataFrame:
     """Rolling max per column, warmup → NaN."""
     if n < 1:
@@ -208,14 +319,16 @@ def _argmax_last(arr: np.ndarray) -> float:
     if np.isnan(arr).all():
         return np.nan
     arr_filled = np.where(np.isnan(arr), -np.inf, arr)
-    return float(np.argmax(arr_filled))
+    # Ties resolve to the most recent bar, matching bottleneck's move_argmax.
+    return float(len(arr) - 1 - np.argmax(arr_filled[::-1]))
 
 
 def _argmin_last(arr: np.ndarray) -> float:
     if np.isnan(arr).all():
         return np.nan
     arr_filled = np.where(np.isnan(arr), np.inf, arr)
-    return float(np.argmin(arr_filled))
+    # Ties resolve to the most recent bar, matching bottleneck's move_argmin.
+    return float(len(arr) - 1 - np.argmin(arr_filled[::-1]))
 
 
 def ts_argmax(df: pd.DataFrame, n: int) -> pd.DataFrame:
@@ -265,6 +378,9 @@ def delta(df: pd.DataFrame, d: int) -> pd.DataFrame:
 def decay_linear(df: pd.DataFrame, n: int) -> pd.DataFrame:
     """Linear decay-weighted moving average, weights ``n, n-1, ..., 1`` normalized.
 
+    The most recent bar gets weight ``n`` and the oldest bar in the window
+    gets weight ``1`` (Kakushadze, *101 Formulaic Alphas*, Appendix A).
+
     Warmup (first ``n-1`` rows) → NaN.
 
     Uses numpy ``sliding_window_view`` + ``einsum`` for vectorized computation
@@ -273,7 +389,8 @@ def decay_linear(df: pd.DataFrame, n: int) -> pd.DataFrame:
     """
     if n < 1:
         raise ValueError(f"decay_linear window must be >= 1, got {n}")
-    weights = np.arange(n, 0, -1, dtype=np.float64)
+    # Windows run oldest -> newest, so ascending weights put n on today's bar.
+    weights = np.arange(1, n + 1, dtype=np.float64)
     weights /= weights.sum()
 
     def _apply(arr: np.ndarray) -> float:
@@ -301,6 +418,33 @@ def signed_power(df: pd.DataFrame, p: float) -> pd.DataFrame:
     arr = df.to_numpy(dtype=np.float64, na_value=np.nan)
     out = np.sign(arr) * np.power(np.abs(arr), p)
     return pd.DataFrame(out, index=df.index, columns=df.columns)
+
+
+def observed_over(*inputs: tuple[pd.DataFrame, int]) -> pd.DataFrame:
+    """Mask of the cells whose every input was observed on each of its last ``n`` bars.
+
+    A comparison or ``np.fmin`` turns an operand that is missing because its
+    window holds a missing input into a verdict — a NaN comparison is False —
+    so those cells must be NaN (#1463). An operand that is undefined on complete
+    data, a constant window's correlation, keeps the alpha's existing verdict
+    (#1452). Masking on the inputs' presence rather than on the operand's NaN is
+    what separates the two. ``n`` is how far back the input reaches through the
+    alpha's nested windows, so the first ``n - 1`` bars (warmup) are masked too.
+
+    Args:
+        *inputs: ``(frame, n)`` pairs, one per input the alpha reads across
+            bars, each with that input's reach in bars.
+
+    Returns:
+        Boolean frame, True where every input was observed throughout its reach.
+    """
+    present = None
+    for frame, n in inputs:
+        seen = frame.notna().astype(float).rolling(n, min_periods=n).min().eq(1.0)
+        present = seen if present is None else present & seen
+    if present is None:
+        raise ValueError("observed_over needs at least one (frame, n) pair")
+    return present
 
 
 def safe_div(a: pd.DataFrame, b: pd.DataFrame, eps: float = 1e-12) -> pd.DataFrame:
@@ -353,3 +497,85 @@ def vwap(panel: dict[str, pd.DataFrame], market: Market | str) -> pd.DataFrame:
     if missing:
         raise KeyError(f"vwap({market.value}) requires panel keys {required}; missing {missing}")
     return (panel["open"] + panel["high"] + panel["low"] + panel["close"]) / 4.0
+
+
+def geometric_wma(frame: pd.DataFrame, window: int) -> pd.DataFrame:
+    """Compute the report's normalized 0.9**age weighted mean.
+
+    Args:
+        frame: Observations ordered oldest to newest.
+        window: Number of complete observations required.
+
+    Returns:
+        A same-shaped frame, with NaN during warmup and across missing windows.
+    """
+    weights = 0.9 ** np.arange(window - 1, -1, -1, dtype=float)
+    weights /= weights.sum()
+    return frame.rolling(window, min_periods=window).apply(lambda values: values @ weights, raw=True)
+
+
+def downside_beta(close: pd.DataFrame, benchmark: pd.DataFrame, samples: int = 252) -> pd.DataFrame:
+    """Regress stock returns on the last selected benchmark-down returns.
+
+    FILTER removes unselected observations; it never replaces them with zero.
+    An unobserved benchmark invalidates selection history. A selected missing
+    stock return remains missing until it leaves the selected-sample window.
+
+    Args:
+        close: Stock closes, one column per instrument.
+        benchmark: Aligned benchmark closes with the same shape.
+        samples: Required number of selected observations.
+
+    Returns:
+        OLS slopes with an intercept, NaN until the selected window is complete.
+    """
+    stock_returns = close.pct_change(fill_method=None)
+    benchmark_returns = benchmark.pct_change(fill_method=None)
+    output = pd.DataFrame(np.nan, index=close.index, columns=close.columns)
+    for col in range(close.shape[1]):
+        selected = []
+        values = []
+        for x, y in zip(benchmark_returns.iloc[:, col], stock_returns.iloc[:, col]):
+            if not np.isfinite(x):
+                selected.clear()
+                values.append(np.nan)
+                continue
+            if x < 0:
+                selected.append((x, y))
+                if len(selected) > samples:
+                    selected.pop(0)
+            if len(selected) != samples:
+                values.append(np.nan)
+                continue
+            pairs = np.asarray(selected)
+            centered = pairs - pairs.mean(axis=0)
+            variance = centered[:, 0] @ centered[:, 0]
+            value = (centered[:, 0] @ centered[:, 1]) / variance if variance > 0 and np.isfinite(pairs).all() else np.nan
+            values.append(value)
+        output.iloc[:, col] = values
+    return output
+
+
+def factor_residuals(returns: pd.DataFrame, factors: list[pd.DataFrame], window: int = 60) -> pd.DataFrame:
+    """Return each trailing multifactor OLS fit's current residual.
+
+    Args:
+        returns: Dependent returns.
+        factors: Aligned factor-return frames.
+        window: Complete trailing observations, including the current bar.
+
+    Returns:
+        Current residuals; singular or missing fits remain NaN.
+    """
+    output = pd.DataFrame(np.nan, index=returns.index, columns=returns.columns)
+    for col in range(returns.shape[1]):
+        y = returns.iloc[:, col].to_numpy(dtype=float)
+        x = np.column_stack([np.ones(len(y)), *[factor.iloc[:, col].to_numpy(dtype=float) for factor in factors]])
+        for end in range(window, len(y) + 1):
+            observed_x, observed_y = x[end - window:end], y[end - window:end]
+            if not np.isfinite(observed_x).all() or not np.isfinite(observed_y).all():
+                continue
+            coefficients, _, rank, _ = np.linalg.lstsq(observed_x, observed_y, rcond=None)
+            if rank == x.shape[1]:
+                output.iloc[end - 1, col] = observed_y[-1] - observed_x[-1] @ coefficients
+    return output

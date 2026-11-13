@@ -41,7 +41,7 @@ __alpha_meta__ = {
     "universe": ["equity_cn"],
     "frequency": ["1d"],
     "decay_horizon": 20,
-    "min_warmup_bars": 21,
+    "min_warmup_bars": 20,
     "notes": 'When current high > MA20(high), output -delta(high,2); else 0.',
 }
 
@@ -49,4 +49,8 @@ def compute(panel: dict) -> pd.DataFrame:
     h = panel["high"]
     m20 = ts_mean(h, 20)
     cond = m20 < h
-    return (-1.0 * delta(h, 2)).where(cond, 0.0)
+    out = (-1.0 * delta(h, 2)).where(cond, 0.0)
+    # A NaN comparison is False, not NaN, so cond is False (never NaN) for
+    # every bar in m20's warmup or a gap's 20-day window, and out falls
+    # through to the finite 0.0 branch instead of NaN.
+    return out.where(m20.notna())

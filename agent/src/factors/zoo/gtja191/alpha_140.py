@@ -39,13 +39,13 @@ ALPHA_ID = "gtja191_140"
 __alpha_meta__ = {
     'id': 'gtja191_140',
     'theme': ['volume'],
-    'formula_latex': 'see body',
+    'formula_latex': 'MIN(RANK(DECAYLINEAR(((RANK(OPEN)+RANK(LOW))-(RANK(HIGH)+RANK(CLOSE))),8)),TSRANK(DECAYLINEAR(CORR(TSRANK(CLOSE,8),TSRANK(MEAN(VOLUME,60),20),8),7),3))',
     'columns_required': ['open', 'high', 'low', 'close', 'volume'],
     'extras_required': [],
     'universe': ['equity_cn'],
     'frequency': ['1d'],
     'decay_horizon': 60,
-    'min_warmup_bars': 100,
+    'min_warmup_bars': 94,
     'notes': 'MIN(a,b) elementwise -> np.minimum.',
 }
 
@@ -66,7 +66,7 @@ def compute(panel):
     v = panel["volume"]
     left = rank(decay_linear((rank(o) + rank(l)) - (rank(h) + rank(c)), 8))
     inner = ts_corr(ts_rank(c, 8), ts_rank(ts_mean(v, 60), 20), 8)
-    right = ts_rank(decay_linear(ts_rank(inner, 7), 7), 3)
+    right = ts_rank(decay_linear(inner, 7), 3)
     arr = np.minimum(left.to_numpy(dtype=np.float64, na_value=np.nan),
                      right.to_numpy(dtype=np.float64, na_value=np.nan))
     out = pd.DataFrame(arr, index=left.index, columns=left.columns)

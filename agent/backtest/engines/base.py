@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -32,6 +33,8 @@ from backtest.loaders.rsshub_events import (
     feed_specs_from_config,
 )
 from backtest.loaders.tushare_fundamentals import (
+    SUBDAILY_POLICIES,
+    SubdailyPitError,
     TushareFundamentalProvider,
     enrich_price_frames_with_fundamentals,
 )
@@ -41,6 +44,8 @@ from backtest.metrics import (
     by_symbol_stats,
     calc_fill_turnover_series,
     calc_metrics,
+    entry_returns,
+    period_returns,
 )
 from backtest.models import EquitySnapshot, FillRecord, Position, TradeRecord
 from backtest.rebalance_mask import (
@@ -111,15 +116,31 @@ def _run_card_data_sources(config: Dict[str, Any], loader: Any) -> List[str]:
 
 # ─── Market detection (lightweight, for signal alignment only) ───
 
-_CRYPTO_RE = _re.compile(r"^[A-Z]+-USDT$|^[A-Z]+/USDT$", _re.I)
-_FOREX_RE = _re.compile(r"^[A-Z]{3}/[A-Z]{3}$|^[A-Z]{6}\.FX$")
+_CRYPTO_RE = _re.compile(
+    r"^(?=[A-Z0-9]*[A-Z])[A-Z0-9]+-USDT$|^(?=[A-Z0-9]*[A-Z])[A-Z0-9]+/USDT$", _re.I
+)
+# Forex / metals in their explicit Yahoo notations, plus the bare-6-char
+# whitelist for XAUUSD / XAGUSD / XPTUSD / XPDUSD and G10 currencies. Mirrors
+# ``backtest.engines._market_hooks._MARKET_PATTERNS`` so the ffill-limit
+# decision (``10`` for cross-market vs ``5`` for single-market) reflects the
+# same market classification the engine composite would assign.
+_FX_RE = _re.compile(
+    r"^[A-Z]{3}/[A-Z]{3}$"
+    r"|^[A-Z]{6}\.FX$"
+    r"|^[A-Z]{6}=X$"
+    r"|^(?:XAU|XAG|XPT|XPD|EUR|GBP|JPY|CHF|CAD|AUD|NZD|USD)[A-Z]{3}$",
+    _re.I,
+)
 
 
 def _detect_market_for_align(code: str) -> str:
     """Lightweight market detection for ffill_limit calculation."""
-    if _CRYPTO_RE.match(code):
+    from backtest.engines._market_hooks import _detect_market
+
+    market = _detect_market(code.strip().upper())
+    if market == "crypto":
         return "crypto"
-    if _FOREX_RE.match(code):
+    if market == "forex":
         return "forex"
     return "equity"
 
@@ -240,10 +261,21 @@ def _align(
         optimizer: Optional weight optimiser ``(ret, pos, dates) -> pos``.
 
     Returns:
-        (dates, close_df, positions_df, returns_df)
+        (dates, close_df, close_val_df, positions_df, returns_df). ``close_df``
+        is the bounded-ffill trading view; ``close_val_df`` carries the last
+        traded close through halts of any length and is only for valuation.
     """
-    # Build unified sorted date index from all symbols' trading calendars
-    indexes = [data_map[c].index for c in codes]
+    # Build unified sorted date index from all symbols' trading calendars.
+    # Everything below works on int64 epochs, and ``asi8`` / ``view("i8")``
+    # count in the index's own unit: a duckdb-backed local source arrives as
+    # datetime64[us], which read as nanoseconds put the run in 1970 and, beside
+    # a nanosecond source, matched none of its bars. One unit for all of them.
+    ns_index = {
+        c: idx if idx.unit == "ns" else idx.as_unit("ns")
+        for c in codes
+        for idx in (data_map[c].index,)
+    }
+    indexes = [ns_index[c] for c in codes]
     merged = np.unique(np.concatenate([index.asi8 for index in indexes]))
     common_tz = indexes[0].tz
     if all(index.tz == common_tz for index in indexes) and common_tz is not None:
@@ -256,6 +288,14 @@ def _align(
 
     # Use int64 view for O(log n) searchsorted lookups
     dates_i8 = dates.values.view("i8")
+    # Daily panels usually share one calendar. Direct placement avoids two
+    # binary-search passes per symbol over an already identical grid. Reuse
+    # each irregular calendar's mapping for both prices and shifted signals.
+    row_indexes = {
+        c: slice(None) if ns_index[c].equals(dates)
+        else np.searchsorted(dates_i8, ns_index[c].asi8)
+        for c in codes
+    }
 
     # ffill with limit to avoid masking long suspensions (e.g. 3-week halt)
     # Cross-market needs larger limit (Chinese New Year can be 9-10 bars)
@@ -265,12 +305,14 @@ def _align(
     close_arr = np.full((n_dates, n_codes), np.nan)
     for j, c in enumerate(codes):
         series = data_map[c]["close"]
-        row_idx = np.searchsorted(dates_i8, series.index.values.view("i8"))
-        close_arr[row_idx, j] = series.values
+        close_arr[row_indexes[c], j] = series.values
 
     # Vectorized ffill with limit using pandas (C-optimized internals)
     _tmp = pd.DataFrame(close_arr)
     close_arr = _tmp.ffill(limit=ffill_limit).values
+    # Valuation marks carry the last traded close through a halt of any
+    # length; the bounded matrix above stays the trading/decision view.
+    close_val_arr = _tmp.ffill().values
 
     # Drop symbols that are entirely NaN (no data overlap with date range)
     all_nan_mask = np.all(np.isnan(close_arr), axis=0)
@@ -282,6 +324,7 @@ def _align(
         if not codes:
             raise ValueError("All symbols have no data in the requested date range")
         close_arr = close_arr[:, keep_mask]
+        close_val_arr = close_val_arr[:, keep_mask]
         n_codes = len(codes)
 
     # Build position matrix: shift on each symbol's OWN calendar, then fill
@@ -301,8 +344,7 @@ def _align(
         shifted_vals[0] = 0.0
         shifted_vals[1:] = sig_vals[:-1]
         # Place into unified grid via searchsorted
-        row_idx = np.searchsorted(dates_i8, own_idx.values.view("i8"))
-        pos_arr[row_idx, j] = shifted_vals
+        pos_arr[row_indexes[c], j] = shifted_vals
 
     # Vectorized ffill with limit using pandas (C-optimized)
     _tmp = pd.DataFrame(pos_arr)
@@ -313,6 +355,7 @@ def _align(
 
     # Construct DataFrames for return
     close = pd.DataFrame(close_arr, index=dates, columns=codes)
+    close_val = pd.DataFrame(close_val_arr, index=dates, columns=codes)
     pos = pd.DataFrame(pos_arr, index=dates, columns=codes)
     ret = bar_returns(close, label="engine per-symbol returns")
 
@@ -322,7 +365,36 @@ def _align(
     scale = pos.abs().sum(axis=1).clip(lower=1.0)
     pos = pos.div(scale, axis=0)
 
-    return dates, close, pos, ret
+    return dates, close, close_val, pos, ret
+
+
+def _basket_entry_returns(
+    close_df: pd.DataFrame, data_map: Dict[str, pd.DataFrame], codes: List[str],
+) -> pd.DataFrame:
+    """Per-symbol returns of the equal-weight basket over the evaluated bars.
+
+    Each symbol is bought at the open of its first traded bar in the window
+    (``metrics.entry_returns``) and marked on the same close matrix the
+    strategy is valued against.
+
+    Args:
+        close_df: Evaluated close matrix from ``_align``.
+        data_map: code -> raw OHLCV DataFrame.
+        codes: Basket symbols, columns of ``close_df``.
+
+    Returns:
+        DataFrame of per-bar returns shaped like ``close_df[codes]``.
+    """
+    columns = {}
+    for code in codes:
+        frame = data_map[code]
+        index = frame.index if frame.index.unit == "ns" else frame.index.as_unit("ns")
+        raw = frame.set_axis(index).reindex(close_df.index)
+        opens = raw["open"] if "open" in raw.columns else None
+        columns[code] = entry_returns(
+            close_df[code], opens, raw["close"].notna(), label=f"benchmark basket {code}",
+        )
+    return pd.DataFrame(columns, index=close_df.index)
 
 
 def _load_optimizer(config: Dict[str, Any]) -> Optional[Callable]:
@@ -391,6 +463,12 @@ def _maybe_enrich_fundamentals(
     if not fields_by_table:
         return data_map
 
+    subdaily = str(config.get("fundamental_subdaily", "reject")).strip().lower()
+    if subdaily not in SUBDAILY_POLICIES:
+        raise ValueError(
+            f"fundamental_subdaily must be one of {SUBDAILY_POLICIES}, got {subdaily!r}"
+        )
+
     try:
         provider = TushareFundamentalProvider()
         return enrich_price_frames_with_fundamentals(
@@ -399,7 +477,14 @@ def _maybe_enrich_fundamentals(
             fields_by_table,
             as_of=config.get("end_date", ""),
             periods=config.get("fundamental_periods"),
+            subdaily=subdaily,
         )
+    except SubdailyPitError:
+        # A contract error (an intraday frame under the default reject policy)
+        # is the caller's to fix and must not be reworded as a provider
+        # failure. Narrow on purpose: a stray ValueError from inside the
+        # enrichment is a failure and keeps the wrapped message.
+        raise
     except Exception as exc:
         raise RuntimeError(
             f"fundamental_fields requested but Tushare enrichment failed: {exc}"
@@ -522,7 +607,52 @@ class BaseEngine(ABC):
         # metrics instead of only to a subclass that overrode the hook.
         self.plan_rejections: Counter = Counter()
         self._bar_idx: int = 0
+        self._bar_ts: Optional[pd.Timestamp] = None  # session being executed
         self._active_symbol: str = ""  # set by _rebalance/_close_position for subclass use
+        # Positions the terminal close was not allowed to sell (see
+        # can_liquidate_at_end). Empty for every market that keeps the default.
+        self.unliquidated_positions: List[Dict[str, Any]] = []
+
+    def available_cash(self, timestamp: pd.Timestamp) -> float:
+        """Spendable funds for an order at timestamp, without changing equity.
+
+        Default preserves legacy immediate-settlement capital across markets.
+        Markets with unsettled receivables may override this hook.
+        """
+        return self.capital
+
+    def projected_reduction_buying_power(
+        self, reductions: list, timestamp: pd.Timestamp,
+    ) -> float:
+        """Incremental buying power from planned closes on this bar.
+
+        Default is the legacy immediate-credit behavior. Settlement-based
+        markets can return zero so a sale never finances a same-bar purchase.
+        """
+        return sum(order.capital_credit for order in reductions)
+
+    def prepare_market_data(
+        self, data_map: Dict[str, pd.DataFrame],
+    ) -> Dict[str, pd.DataFrame]:
+        """Validate or normalize loaded bars before signals see them.
+
+        Default returns the frames untouched, so every market keeps its
+        loader output. A market whose source data needs a documented unit
+        convention (e.g. a depositary-receipt ratio change) overrides this;
+        running before signal generation keeps signals and fills on the
+        same price basis.
+        """
+        return data_map
+
+    def can_liquidate_at_end(self, symbol: str, timestamp: pd.Timestamp) -> bool:
+        """Whether the terminal forced close may sell *symbol* on the last bar.
+
+        Default True keeps the legacy behavior of every market. A market whose
+        securities cannot be sold before settlement overrides this so the
+        end-of-backtest close does not bypass the rule that gates signal exits.
+        Positions it refuses stay open and are valued, not traded.
+        """
+        return True
 
     # ── Market rule interface (subclass must implement) ──
 
@@ -550,6 +680,21 @@ class BaseEngine(ABC):
         Returns:
             Rounded size.
         """
+
+    def _execution_commission(self, size: float, price: float, direction: int, is_open: bool) -> float:
+        """Apply the declared experiment multiplier to execution fees and taxes."""
+        multiplier = float(self.config.get("execution_cost_multiplier", 1.0))
+        if not math.isfinite(multiplier) or multiplier < 0:
+            raise ValueError("execution_cost_multiplier must be finite and non-negative")
+        return self.calc_commission(size, price, direction, is_open) * multiplier
+
+    def _execution_price(self, price: float, direction: int) -> float:
+        """Apply extra adverse slippage before the venue's tick-grid rounding."""
+        bps = float(self.config.get("extra_slippage_bps", 0.0))
+        if not math.isfinite(bps) or not 0 <= bps < 10000:
+            raise ValueError("extra_slippage_bps must be finite and in [0, 10000)")
+        shocked = price + abs(price) * direction * bps / 10000 if bps else price
+        return self.apply_slippage(shocked, direction)
 
     @abstractmethod
     def calc_commission(self, size: float, price: float, direction: int, is_open: bool) -> float:
@@ -646,7 +791,7 @@ class BaseEngine(ABC):
         price = float(raw)
         if price <= 0 and not self.allow_nonpositive_prices:
             return None
-        return self.apply_slippage(price, direction)
+        return self._execution_price(price, direction)
 
     def limit_band(
         self, symbol: str, bar: pd.Series, limit: float
@@ -718,6 +863,7 @@ class BaseEngine(ABC):
         "execution_blocked",
         "invalid_price",
         "zero_size",
+        "insufficient_capital",
     )
 
     def _plan_rejection_metrics(self) -> Dict[str, Any]:
@@ -746,6 +892,20 @@ class BaseEngine(ABC):
             "unfilled_plan_rejections_by_symbol": by_symbol,
         }
 
+    def _engine_diagnostics(self) -> Dict[str, Any]:
+        """Per-engine facts about how this run was priced.
+
+        Default empty. An engine overrides this to state something the metrics
+        cannot be derived from — currently ChinaFuturesEngine reporting which
+        products it priced on a generic default instead of a table entry
+        (#1393), where the alternative is a number that looks like data.
+
+        Returns:
+            Extra keys merged into the metrics dict; empty when there is
+            nothing to declare.
+        """
+        return {}
+
     def _on_plan_rejected(self, symbol: str, reason: str, timestamp: pd.Timestamp) -> None:
         """Observe a silently rejected opening-order plan.
 
@@ -756,11 +916,17 @@ class BaseEngine(ABC):
         an engine subclass to tell "nothing to do" apart from "wanted but
         unfillable".
 
+        The capital fit reports one more cause after the planner: a sleeve that
+        was a real order at full scale and left the basket when every opening
+        order was scaled down to the cash available is ``insufficient_capital``
+        (#1470), reported once per bar — never the trial plans of the search.
+
         Args:
             symbol: Instrument the plan was for.
             reason: Machine-readable cause: ``no_target_weight``,
                 ``already_held``, ``no_data``, ``no_bar``,
-                ``execution_blocked``, ``invalid_price`` or ``zero_size``.
+                ``execution_blocked``, ``invalid_price``, ``zero_size`` or
+                ``insufficient_capital``.
             timestamp: Decision bar timestamp.
         """
         self.plan_rejections[(symbol, reason)] += 1
@@ -834,6 +1000,7 @@ class BaseEngine(ABC):
         Returns:
             Metrics dictionary.
         """
+        trace_started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         codes = config.get("codes", [])
         interval = config.get("interval", "1D")
         extra_fields = config.get("extra_fields") or None
@@ -851,6 +1018,7 @@ class BaseEngine(ABC):
             sys.exit(1)
         data_map = _maybe_enrich_fundamentals(data_map, config)
         data_map = _maybe_enrich_events(data_map, config)
+        data_map = self.prepare_market_data(data_map)
 
         # 2. Generate signals
         signal_map = signal_engine.generate(data_map)
@@ -875,7 +1043,7 @@ class BaseEngine(ABC):
 
         # 3. Pre-compute target weights (with optimizer)
         opt_fn = _load_optimizer(config)
-        dates, close_df, target_pos, ret_df = _align(
+        dates, close_df, close_val_df, target_pos, ret_df = _align(
             data_map, signal_map, valid_codes, optimizer=opt_fn,
         )
 
@@ -891,11 +1059,12 @@ class BaseEngine(ABC):
         if warmup_end:
             dates = dates[warmup_end:]
             close_df = close_df.iloc[warmup_end:]
+            close_val_df = close_val_df.iloc[warmup_end:]
             target_pos = target_pos.iloc[warmup_end:]
             ret_df = ret_df.iloc[warmup_end:]
 
         # 4. Bar-by-bar execution
-        self._execute_bars(dates, data_map, close_df, target_pos, valid_codes)
+        self._execute_bars(dates, data_map, close_df, target_pos, valid_codes, close_val_df=close_val_df)
         actual_pos = self._actual_positions_frame(valid_codes)
 
         # 5. Build output series
@@ -903,44 +1072,44 @@ class BaseEngine(ABC):
             [s.equity for s in self.equity_snapshots],
             index=[s.timestamp for s in self.equity_snapshots],
         )
-        bench_ret = ret_df.mean(axis=1) if ret_df.shape[1] > 0 else pd.Series(0.0, index=dates)
-        benchmark_metadata = {}
+        # ret_df runs from each bar's previous close, so its first evaluated row
+        # starts at the last warm-up close. The basket instead buys each symbol
+        # at its first traded open in the window, as the strategy can.
+        basket_ret = _basket_entry_returns(close_df, data_map, list(ret_df.columns))
+        bench_ret = basket_ret.mean(axis=1) if basket_ret.shape[1] > 0 else pd.Series(0.0, index=dates)
+        from backtest.benchmark import default_benchmark, resolve_benchmark
 
-        # ── External benchmark fetch ──────────────────────────────────────────
-        bench_ticker = config.get("benchmark")
-        if bench_ticker and bench_ticker != "auto":
-            from backtest.benchmark import resolve_benchmark
-            bench_source = config.get("source", "yfinance")
-            bench_result = resolve_benchmark(
-                strategy_codes=codes,
-                source=bench_source,
-                start_date=config.get("start_date", ""),
-                end_date=config.get("end_date", ""),
-                interval=interval,
-                explicit=bench_ticker,
-                # Explicit source: fetch the benchmark through its own loader
-                # (keeps e.g. source=local offline). Auto keeps the yfinance
-                # default — its loader only wraps the preloaded strategy data.
-                loader=loader if bench_source != "auto" else None,
+        basket_codes = list(ret_df.columns)
+        basket_label = (
+            f"equal-weight basket ({basket_codes[0]})" if len(basket_codes) == 1
+            else f"equal-weight basket of {len(basket_codes)} symbols"
+        )
+        benchmark_metadata = {"benchmark_kind": "equal_weight", "benchmark_label": basket_label}
+        requested = config.get("benchmark")
+        source = config.get("source", "yfinance")
+        ticker = default_benchmark(basket_codes, source) if requested == "auto" else requested
+        reason = "no default benchmark for the evaluated symbols" if requested == "auto" else "no benchmark requested"
+        if ticker:
+            result = resolve_benchmark(
+                strategy_codes=basket_codes,
+                source="local" if config.get("frozen_data_manifest") else source,
+                explicit=ticker,
+                start_date=config.get("start_date", ""), end_date=config.get("end_date", ""),
+                interval=interval, loader=loader if source != "auto" or config.get("frozen_data_manifest") else None,
             )
-            if bench_result is not None:
-                bench_ret = bench_result.ret_series.reindex(dates).fillna(0.0)
-                # The benchmark is fetched over the requested start_date..
-                # end_date, but a declared warm-up boundary makes the EVALUATED
-                # window shorter than that (`dates` is already clipped above).
-                # Grading total_return over the short window against a
-                # benchmark measured over the long one is the mismatched-window
-                # error the warm-up boundary exists to prevent, so re-measure
-                # the benchmark over the same bars. Falls back to the fetched
-                # total only when the overlap is too short to measure.
-                window_ret = bench_result.total_return_over(dates)
+            window_return = result.total_return_over(dates) if result is not None else None
+            if result is not None and window_return is not None:
+                bench_ret = result.returns_over(dates)
                 benchmark_metadata = {
-                    "benchmark_ticker": bench_result.ticker,
-                    "benchmark_return": (
-                        window_ret if window_ret is not None else bench_result.total_ret
-                    ),
+                    "benchmark_kind": "external", "benchmark_label": result.ticker,
+                    "benchmark_ticker": result.ticker, "benchmark_return": window_return,
                 }
-        # ── External benchmark fetch ──────────────────────────────────────────
+            else:
+                reason = f"benchmark {ticker!r} could not be resolved over the evaluation window"
+        benchmark_warning = (
+            f"{reason}; benchmark-relative metrics use the {basket_label}"
+            if benchmark_metadata["benchmark_kind"] == "equal_weight" else None
+        )
 
         bench_equity = self.initial_capital * (1 + bench_ret).cumprod()
 
@@ -971,6 +1140,7 @@ class BaseEngine(ABC):
                 m["total_return"] - benchmark_metadata["benchmark_return"], 6
             )
         m.update(self._plan_rejection_metrics())
+        m.update(self._engine_diagnostics())
         if self.rebalance_mask is not None:
             m["rebalance_mask"] = self.rebalance_mask
             m["rebalance_bars_executed"] = self.rebalance_bars_executed
@@ -1032,21 +1202,20 @@ class BaseEngine(ABC):
             )
 
         # Portfolio Studio: risk x-ray over the strategy's average basket.
-        # Short runs and never-invested strategies raise ValueError in the
-        # derivation and simply get no x-ray artifact.
         from backtest.risk_xray import (
             average_invested_weights,
             compute_risk_xray,
             render_risk_xray_markdown,
             write_risk_xray,
         )
+        xray_warning = None
         try:
             basket_weights, avg_invested = average_invested_weights(actual_pos)
             risk_xray = compute_risk_xray(
                 close_df, basket_weights, periods_per_year=bars_per_year,
             )
-        except ValueError:
-            pass
+        except ValueError as exc:
+            xray_warning = f"Risk x-ray unavailable: {exc}"
         else:
             write_risk_xray(run_dir / "artifacts" / "risk_xray.json", risk_xray)
             (run_dir / "artifacts" / "risk_xray.md").write_text(
@@ -1082,6 +1251,14 @@ class BaseEngine(ABC):
         card_warnings = list(config.get("content_filter_warnings") or [])
         if config.get("_run_card_caliber_warning"):
             card_warnings.append(config["_run_card_caliber_warning"])
+        if config.get("_run_card_annualisation_warning"):
+            card_warnings.append(config["_run_card_annualisation_warning"])
+        if config.get("_run_card_unrecognized_config_warning"):
+            card_warnings.append(config["_run_card_unrecognized_config_warning"])
+        if xray_warning:
+            card_warnings.append(xray_warning)
+        if benchmark_warning:
+            card_warnings.append(benchmark_warning)
         from backtest.run_card import write_run_card
         write_run_card(
             run_dir,
@@ -1090,6 +1267,16 @@ class BaseEngine(ABC):
             data_sources=_run_card_data_sources(config, loader),
             strategy_path=run_dir / "code" / "signal_engine.py",
             warnings=card_warnings or None,
+            tool_traces=[
+                {
+                    "tool": "backtest",
+                    "args": config,
+                    "started_at": trace_started_at,
+                    "ended_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "status": "ok",
+                    "result": m,
+                }
+            ],
         )
 
         # Print scalar metrics (skip nested dicts for JSON compat).
@@ -1107,6 +1294,7 @@ class BaseEngine(ABC):
         close_df: pd.DataFrame,
         target_pos: pd.DataFrame,
         codes: List[str],
+        close_val_df: Optional[pd.DataFrame] = None,
     ) -> None:
         """Bar-by-bar execution with market rule enforcement."""
         # Pre-extract numpy arrays for O(1) indexed access instead of DataFrame.at[]
@@ -1114,9 +1302,13 @@ class BaseEngine(ABC):
         # regardless of DataFrame internal column ordering (which may be alphabetical).
         _target_arr = target_pos[codes].values  # (n_dates, n_codes) ndarray
         _close_arr = close_df[codes].values  # (n_dates, n_codes) ndarray
+        if close_val_df is None:
+            close_val_df = close_df.ffill()
+        _val_arr = close_val_df[codes].values  # unbounded ffill, valuation only
         _code_to_col = {c: j for j, c in enumerate(codes)}
         # Store as instance attrs for use in _calc_equity / _safe_price
         self._close_arr = _close_arr
+        self._val_arr = _val_arr
         self._code_to_col = _code_to_col
         self.actual_position_snapshots = []
         execution_dates = resolve_rebalance_dates(self.rebalance_mask, dates)
@@ -1124,6 +1316,7 @@ class BaseEngine(ABC):
 
         for i, ts in enumerate(dates):
             self._bar_idx = i
+            self._bar_ts = ts
 
             stop_run = self.before_rebalance_bar(ts, data_map, codes)
             execute_targets = execution_dates is None or ts in execution_dates
@@ -1192,12 +1385,12 @@ class BaseEngine(ABC):
                 if current_pos is None and target_dir != 0:
                     open_targets.append((c, target_w, data_map.get(c)))
 
-            def _plans(scale: float) -> list[_OpenOrder]:
+            def _plans(scale: float, *, observe: bool) -> list[_OpenOrder]:
                 result: list[_OpenOrder] = []
                 for c, target_w, frame in open_targets:
                     try:
                         order = self._plan_open_order(
-                            c, target_w * scale, frame, ts, equity
+                            c, target_w * scale, frame, ts, equity, observe=observe
                         )
                     except Exception as exc:
                         logger.warning(
@@ -1211,16 +1404,31 @@ class BaseEngine(ABC):
                         result.append(order)
                 return result
 
-            planned = _plans(1.0)
-            if sum(order.cost for order in planned) > self.capital + 1e-9:
+            planned = _plans(1.0, observe=True)
+            if sum(order.cost for order in planned) > self.available_cash(ts) + 1e-9:
+                # The trial plans of the search are not findings: one starved
+                # open used to be booked as a zero_size rejection on every
+                # bisection step (#1470). The sleeve that leaves the basket is
+                # reported once, after the search, as the rebalance path does.
+                wanted = [order.symbol for order in planned]
+                # Nothing fits until a candidate proves it does: with cash below
+                # zero (a funding debit leaves it there) not even the empty plan
+                # fits, and the full-scale plan used to fall through to
+                # _execute_open_order and abort the run (#1542).
+                fitting: list[_OpenOrder] = []
                 low, high = 0.0, 1.0
                 for _ in range(50):
                     mid = (low + high) / 2.0
-                    candidate = _plans(mid)
-                    if sum(order.cost for order in candidate) <= self.capital + 1e-9:
-                        low, planned = mid, candidate
+                    candidate = _plans(mid, observe=False)
+                    if sum(order.cost for order in candidate) <= self.available_cash(ts) + 1e-9:
+                        low, fitting = mid, candidate
                     else:
                         high = mid
+                planned = fitting
+                fitted = {order.symbol for order in planned}
+                for symbol in wanted:
+                    if symbol not in fitted:
+                        self._on_plan_rejected(symbol, "insufficient_capital", ts)
 
             for order in planned:
                 self._execute_open_order(order, ts)
@@ -1243,6 +1451,7 @@ class BaseEngine(ABC):
                     self._safe_price(
                         close_df, ts, s, ep,
                         _arr=_close_arr, _row=i, _col=_code_to_col.get(s),
+                        _val_arr=_val_arr,
                     )
                     for s, ep in zip(_syms, _eps)
                 ])
@@ -1253,6 +1462,7 @@ class BaseEngine(ABC):
                     cp = self._safe_price(
                         close_df, ts, p.symbol, p.entry_price,
                         _arr=_close_arr, _row=i, _col=_code_to_col.get(p.symbol),
+                        _val_arr=_val_arr,
                     )
                     total_unrealized += self._calc_pnl(p.symbol, p.direction, p.size, p.entry_price, cp)
             self.equity_snapshots.append(EquitySnapshot(
@@ -1270,34 +1480,61 @@ class BaseEngine(ABC):
         if len(dates) > 0:
             _last_row = min(self._bar_idx, len(dates) - 1)
             last_ts = dates[_last_row]
+            self.unliquidated_positions = []
+            retained_value = 0.0
             for c in list(self.positions.keys()):
                 pos = self.positions[c]
                 mark_price = self._safe_price(
                     close_df, last_ts, c, pos.entry_price,
                     _arr=_close_arr, _row=_last_row, _col=_code_to_col.get(c),
+                    _val_arr=_val_arr,
                 )
                 self._active_symbol = c
-                exit_price = self.apply_slippage(mark_price, -pos.direction)
+                exit_price = self._execution_price(mark_price, -pos.direction)
+                if not self.can_liquidate_at_end(c, last_ts):
+                    # The market's sell rule (e.g. unsettled securities) also
+                    # binds the terminal close: keep the position open and
+                    # value it at what a close would net, without booking a
+                    # trade the rules would not have allowed.
+                    proceeds = self._close_proceeds(pos, exit_price)
+                    retained_value += proceeds
+                    self.unliquidated_positions.append({
+                        "symbol": c,
+                        "size": pos.size,
+                        "entry_price": pos.entry_price,
+                        "mark_price": mark_price,
+                        "estimated_exit_price": exit_price,
+                        "estimated_net_proceeds": proceeds,
+                    })
+                    continue
                 self._close_position(c, exit_price, last_ts, "end_of_backtest")
 
             # The final snapshot feeds metrics and artifacts.  Replace its
             # pre-liquidation mark with post-liquidation cash so terminal
             # slippage and exit commission are reflected in reported equity.
             if self.equity_snapshots:
+                terminal_equity = self.capital + retained_value
                 self.equity_snapshots[-1] = EquitySnapshot(
                     timestamp=last_ts,
                     capital=self.capital,
-                    unrealized=0.0,
-                    equity=self.capital,
-                    positions=0,
+                    unrealized=terminal_equity - self.capital - sum(
+                        self._calc_margin(p.symbol, p.size, p.entry_price, p.leverage)
+                        for p in self.positions.values()
+                    ),
+                    equity=terminal_equity,
+                    positions=len(self.positions),
                 )
             if self.actual_position_snapshots:
-                self.actual_position_snapshots[-1] = (
-                    last_ts, {code: 0.0 for code in codes}
-                )
+                final_weights = {code: 0.0 for code in codes}
+                if self.positions and self.equity_snapshots[-1].equity > 1e-12:
+                    final_weights = self._actual_weights(
+                        close_df, last_ts, codes, self.equity_snapshots[-1].equity
+                    )
+                self.actual_position_snapshots[-1] = (last_ts, final_weights)
 
         # Clean up temporary instance attributes
         self._close_arr = None
+        self._val_arr = None
         self._code_to_col = None
 
     def _calc_open_equity(
@@ -1319,11 +1556,13 @@ class BaseEngine(ABC):
         equity = self.capital
         for sym, pos in self.positions.items():
             _arr = getattr(self, "_close_arr", None)
+            _varr = getattr(self, "_val_arr", None)
             _row = getattr(self, "_bar_idx", None)
             _c2c = getattr(self, "_code_to_col", None)
             current_price = self._safe_price(
                 close_df, ts, sym, pos.entry_price,
                 _arr=_arr, _row=_row, _col=(_c2c.get(sym) if _c2c else None),
+                _val_arr=_varr,
             )
             frame = data_map.get(sym)
             if frame is not None and ts in frame.index:
@@ -1355,6 +1594,7 @@ class BaseEngine(ABC):
 
         # Use array fast-path when available
         _arr = getattr(self, "_close_arr", None)
+        _varr = getattr(self, "_val_arr", None)
         _row = getattr(self, "_bar_idx", None)
         _c2c = getattr(self, "_code_to_col", None)
 
@@ -1369,11 +1609,13 @@ class BaseEngine(ABC):
                 self._safe_price(
                     close_df, ts, s, ep,
                     _arr=_arr, _row=_row, _col=(_c2c.get(s) if _c2c else None),
+                    _val_arr=_varr,
                 )
                 for s, ep in zip(syms, entry_prices)
             ])
 
-            margins = sizes * entry_prices / leverages
+            # abs() as in _calc_margin: collateral stays positive at a negative price.
+            margins = sizes * np.abs(entry_prices) / leverages
             pnls = directions * sizes * (current_prices - entry_prices)
             return self.capital + float(np.sum(margins + pnls))
 
@@ -1382,6 +1624,7 @@ class BaseEngine(ABC):
             cp = self._safe_price(
                 close_df, ts, sym, pos.entry_price,
                 _arr=_arr, _row=_row, _col=(_c2c.get(sym) if _c2c else None),
+                _val_arr=_varr,
             )
             margin = self._calc_margin(sym, pos.size, pos.entry_price, pos.leverage)
             unrealized = self._calc_pnl(sym, pos.direction, pos.size, pos.entry_price, cp)
@@ -1415,14 +1658,14 @@ class BaseEngine(ABC):
             if need_close:
                 if self.can_execute(symbol, 0, bar):
                     open_price = self.execution_open(bar)
-                    price = self.apply_slippage(open_price, -current_pos.direction)
+                    price = self._execution_price(open_price, -current_pos.direction)
                     self._close_position(symbol, price, ts, "signal")
                 else:
                     return  # blocked (e.g. limit-down can't sell)
 
         if target_dir != 0 and symbol not in self.positions:
             order = self._plan_open_order(symbol, target_weight, df, ts, equity)
-            if order is not None and order.cost <= self.capital + 1e-9:
+            if order is not None and order.cost <= self.available_cash(ts) + 1e-9:
                 self._execute_open_order(order, ts)
 
     def _plan_open_order(
@@ -1434,25 +1677,35 @@ class BaseEngine(ABC):
         equity: float,
         *,
         allow_existing: bool = False, require_positive_price: bool = False,
+        observe: bool = True,
     ) -> Optional[_OpenOrder]:
-        """Price an opening order without mutating portfolio state."""
+        """Price an opening order without mutating portfolio state.
+
+        ``observe=False`` plans a trial inside a capital-fit search: a rejection
+        there is not a finding and is not reported to ``_on_plan_rejected``.
+        """
         self._active_symbol = symbol
+
+        def rejected(reason: str) -> None:
+            if observe:
+                self._on_plan_rejected(symbol, reason, ts)
+
         direction = 1 if target_weight > 1e-9 else (-1 if target_weight < -1e-9 else 0)
         if direction == 0:
-            self._on_plan_rejected(symbol, "no_target_weight", ts)
+            rejected("no_target_weight")
             return None
         if symbol in self.positions and not allow_existing:
-            self._on_plan_rejected(symbol, "already_held", ts)
+            rejected("already_held")
             return None
         if df is None:
-            self._on_plan_rejected(symbol, "no_data", ts)
+            rejected("no_data")
             return None
         if ts not in df.index:
-            self._on_plan_rejected(symbol, "no_bar", ts)
+            rejected("no_bar")
             return None
         bar = df.loc[ts]
         if not self.can_execute(symbol, direction, bar):
-            self._on_plan_rejected(symbol, "execution_blocked", ts)
+            rejected("execution_blocked")
             return None
         open_price = self.execution_open(bar)
         if require_positive_price:
@@ -1461,9 +1714,9 @@ class BaseEngine(ABC):
         # negatives are rejected unless this engine opted into non-positive
         # prices, in which case abs()-based sizing/margin below handle them.
         elif open_price == 0 or (open_price < 0 and not self.allow_nonpositive_prices):
-            self._on_plan_rejected(symbol, "invalid_price", ts)
+            rejected("invalid_price")
             return None
-        price = self.apply_slippage(open_price, direction)
+        price = self._execution_price(open_price, direction)
         if require_positive_price:
             self._validate_rebalance_values(price, positive=True)
         leverage = self._leverage_for_symbol(symbol)
@@ -1472,10 +1725,10 @@ class BaseEngine(ABC):
             self._calc_raw_size(symbol, target_notional, price), price
         )
         if size <= 0:
-            self._on_plan_rejected(symbol, "zero_size", ts)
+            rejected("zero_size")
             return None
         margin = self._calc_margin(symbol, size, price, leverage)
-        commission = self.calc_commission(
+        commission = self._execution_commission(
             size, price, direction, is_open=True
         )
         return _OpenOrder(
@@ -1572,7 +1825,7 @@ class BaseEngine(ABC):
                         continue
                     raw_price = self.execution_open(bar)
                     self._validate_rebalance_values(raw_price, positive=True)
-                    price = self.apply_slippage(raw_price, -before.direction)
+                    price = self._execution_price(raw_price, -before.direction)
                     self._validate_rebalance_values(price, positive=True)
                     reductions.append(self._plan_reduction(before, 0.0, price))
                     if target_direction == 0:
@@ -1599,8 +1852,8 @@ class BaseEngine(ABC):
             self._validate_rebalance_values(raw_price, before.leverage, leverage)
             target_notional = abs(target_weight) * equity * before.leverage
             prices = (
-                self.apply_slippage(raw_price, before.direction),
-                self.apply_slippage(raw_price, -before.direction),
+                self._execution_price(raw_price, before.direction),
+                self._execution_price(raw_price, -before.direction),
             )
             self._validate_rebalance_values(*prices, positive=True)
             sizes = tuple(
@@ -1646,7 +1899,7 @@ class BaseEngine(ABC):
                     size=size,
                     leverage=leverage,
                     margin=self._calc_margin(symbol, size, price, leverage),
-                    commission=self.calc_commission(
+                    commission=self._execution_commission(
                         size, price, before.direction, is_open=True
                     ),
                 )
@@ -1658,13 +1911,32 @@ class BaseEngine(ABC):
                 reductions.append(self._plan_reduction(before, target_size, price))
 
         projected_capital = (
-            self.capital
-            + sum(order.capital_credit for order in reductions)
+            self.available_cash(ts)
+            + self.projected_reduction_buying_power(reductions, ts)
             - sum(order.cost for order in opens)
         )
         self._validate_rebalance_values(projected_capital)
         if projected_capital < -1e-9:
-            raise ValueError("insufficient capital for position rebalance")
+            fitted = self._fit_rebalance_opens(opens, reductions, ts)
+            if fitted is None:
+                if self.projected_reduction_buying_power(reductions, ts) < 0:
+                    # The reductions themselves consume cash (a close whose loss
+                    # exceeds its margin): no dropping of opens repairs that, so
+                    # the bar aborts atomically as #1274 decided.
+                    raise ValueError("insufficient capital for position rebalance")
+                # Cash was already below zero (a funding debit can leave it
+                # there) and the reductions only release it: drop every open,
+                # still run the reductions, and report each open (#1542).
+                for order in opens:
+                    self._on_plan_rejected(order.symbol, "insufficient_capital", ts)
+                if opens:
+                    logger.warning(
+                        "Cash below zero at %s; no open or increase fits, dropped: %s",
+                        ts,
+                        ", ".join(sorted({order.symbol for order in opens})),
+                    )
+                fitted = []
+            opens = fitted
 
         for order in reductions:
             if order.target_size <= 1e-9:
@@ -1676,6 +1948,97 @@ class BaseEngine(ABC):
                 self._execute_position_increase(order, ts)
             else:
                 self._execute_open_order(order, ts)
+
+    def _fit_rebalance_opens(
+        self,
+        opens: list[_OpenOrder],
+        reductions: list[_ReductionOrder],
+        ts: pd.Timestamp,
+    ) -> Optional[list[_OpenOrder]]:
+        """Scale the open sleeve by one common factor so the basket fits.
+
+        #1274: a fully invested target basket plus commission overdrafts by a
+        hair and used to abort atomically. Instead, mirror the open-basket
+        path's fairness behavior: reductions commit as planned (they release
+        capital toward the targets), and every capital-consuming sleeve —
+        fresh opens and same-direction increases alike — scales by one common
+        factor, preserving portfolio proportions on sizes/notionals (post-fee
+        capital weights shift by each sleeve's fee, as with the open path).
+        Sizes re-round per market lot rules; a sleeve whose rounded size hits
+        zero is dropped and recorded via ``_on_plan_rejected`` as
+        ``insufficient_capital`` — it was a real order at full scale, so it is
+        the cash that failed, not the lot rule (#1470) — so run-card
+        diagnostics see the dropped leg.
+
+        Returns the fitted orders, or ``None`` when no scale fits — not even
+        an empty open sleeve; nothing has been committed at that point. The
+        caller aborts atomically when the reductions themselves consume cash
+        (#1274), and otherwise — cash was already below zero — drops every
+        open and still runs the reductions (#1542).
+        """
+        released = self.projected_reduction_buying_power(reductions, ts)
+
+        def _fits(candidate: list[_OpenOrder]) -> bool:
+            projected = self.available_cash(ts) + released - sum(order.cost for order in candidate)
+            self._validate_rebalance_values(projected)
+            return projected >= -1e-9
+
+        def _at_scale(scale: float) -> list[_OpenOrder]:
+            scaled: list[_OpenOrder] = []
+            for order in opens:
+                # round_size/calc_commission dispatch on the active symbol
+                # (lot grids, per-symbol fee schedules) — same contract as
+                # _plan_open_order.
+                self._active_symbol = order.symbol
+                size = self.round_size(order.size * scale, order.price)
+                if size <= 0:
+                    continue
+                candidate = _OpenOrder(
+                    symbol=order.symbol,
+                    direction=order.direction,
+                    price=order.price,
+                    size=size,
+                    leverage=order.leverage,
+                    margin=self._calc_margin(
+                        order.symbol, size, order.price, order.leverage
+                    ),
+                    commission=self._execution_commission(
+                        size, order.price, order.direction, is_open=True
+                    ),
+                )
+                self._validate_rebalance_values(
+                    candidate.price,
+                    candidate.leverage,
+                    candidate.size,
+                    candidate.margin,
+                    candidate.commission,
+                )
+                scaled.append(candidate)
+            return scaled
+
+        fitted: Optional[list[_OpenOrder]] = None
+        low, high = 0.0, 1.0
+        for _ in range(50):
+            mid = (low + high) / 2.0
+            candidate = _at_scale(mid)
+            if _fits(candidate):
+                low, fitted = mid, candidate
+            else:
+                high = mid
+        if fitted is not None and len(fitted) < len(opens):
+            dropped_symbols = sorted(
+                {order.symbol for order in opens}
+                - {order.symbol for order in fitted}
+            )
+            for symbol in dropped_symbols:
+                self._on_plan_rejected(symbol, "insufficient_capital", ts)
+            logger.warning(
+                "Rebalance basket scaled to fit capital; sleeves rounded to "
+                "zero and dropped: %s. Set position_adjustment='hold' or "
+                "reduce targets if these fills are required.",
+                ", ".join(dropped_symbols),
+            )
+        return fitted
 
     @staticmethod
     def _validate_rebalance_values(*values: float, positive: bool = False) -> None:
@@ -1698,7 +2061,7 @@ class BaseEngine(ABC):
         realized_pnl = self._calc_pnl(
             before.symbol, before.direction, closed_size, before.entry_price, price
         )
-        exit_commission = self.calc_commission(
+        exit_commission = self._execution_commission(
             closed_size, price, before.direction, is_open=False
         )
         self._validate_rebalance_values(
@@ -1715,7 +2078,7 @@ class BaseEngine(ABC):
         before = self.positions[order.symbol]
         if order.direction != before.direction:
             raise ValueError("position increase direction must match the open position")
-        if order.cost > self.capital + 1e-7:
+        if order.cost > self.available_cash(ts) + 1e-7:
             raise RuntimeError(
                 f"planned order for {order.symbol} exceeds available capital"
             )
@@ -1785,6 +2148,8 @@ class BaseEngine(ABC):
             commission=entry_commission + order.exit_commission,
             entry_margin=order.released_margin,
             exit_margin=exit_margin,
+            open_price=before.open_price,
+            open_size=before.open_size,
         ))
         self._record_fill(
             symbol=before.symbol,
@@ -1811,7 +2176,7 @@ class BaseEngine(ABC):
 
     def _execute_open_order(self, order: _OpenOrder, ts: pd.Timestamp) -> None:
         """Commit a previously priced opening order."""
-        if order.cost > self.capital + 1e-7:
+        if order.cost > self.available_cash(ts) + 1e-7:
             raise RuntimeError(
                 f"planned order for {order.symbol} exceeds available capital"
             )
@@ -1825,6 +2190,8 @@ class BaseEngine(ABC):
             leverage=order.leverage,
             entry_bar_idx=self._bar_idx,
             entry_commission=order.commission,
+            open_price=order.price,
+            open_size=order.size,
         )
         self._record_fill(
             symbol=order.symbol,
@@ -1858,6 +2225,7 @@ class BaseEngine(ABC):
                 _arr=getattr(self, "_close_arr", None),
                 _row=getattr(self, "_bar_idx", None),
                 _col=getattr(self, "_code_to_col", {}).get(symbol),
+                _val_arr=getattr(self, "_val_arr", None),
             )
             margin_value = self._calc_margin(
                 symbol, pos.size, price, pos.leverage
@@ -1878,6 +2246,19 @@ class BaseEngine(ABC):
         frame.index.name = "timestamp"
         return frame
 
+    def _close_proceeds(self, pos: Position, exit_price: float) -> float:
+        """Capital a close at *exit_price* would return, without closing.
+
+        Mirrors the credit in ``_close_position`` (margin + pnl - exit
+        commission) so a position valued this way is worth exactly what the
+        close would have booked.
+        """
+        self._active_symbol = pos.symbol
+        pnl = self._calc_pnl(pos.symbol, pos.direction, pos.size, pos.entry_price, exit_price)
+        margin = self._calc_margin(pos.symbol, pos.size, pos.entry_price, pos.leverage)
+        exit_comm = self._execution_commission(pos.size, exit_price, pos.direction, is_open=False)
+        return margin + pnl - exit_comm
+
     def _close_position(
         self,
         symbol: str,
@@ -1895,7 +2276,7 @@ class BaseEngine(ABC):
         margin = self._calc_margin(symbol, pos.size, pos.entry_price, pos.leverage)
         exit_margin = self._calc_margin(symbol, pos.size, exit_price, pos.leverage)
         pnl_pct = pnl / margin * 100 if margin > 1e-9 else 0.0
-        exit_comm = self.calc_commission(pos.size, exit_price, pos.direction, is_open=False)
+        exit_comm = self._execution_commission(pos.size, exit_price, pos.direction, is_open=False)
 
         self.capital += margin + pnl - exit_comm
 
@@ -1917,6 +2298,8 @@ class BaseEngine(ABC):
             commission=pos.entry_commission + exit_comm,
             entry_margin=margin,
             exit_margin=exit_margin,
+            open_price=pos.open_price,
+            open_size=pos.open_size,
         ))
         self._record_fill(
             symbol=symbol,
@@ -2022,9 +2405,12 @@ class BaseEngine(ABC):
         for code, df in data_map.items():
             df.to_csv(out / f"ohlcv_{code}.csv")
 
-        # Equity curve
-        port_ret = equity_series.pct_change().fillna(0.0)
-        peak = equity_series.cummax()
+        # Equity curve. Same cash-seeded returns as calc_metrics, so the ret
+        # column compounds back to total_return and agrees with drawdown.
+        port_ret = period_returns(equity_series, self.initial_capital).fillna(0.0)
+        # Same high-water mark as calc_metrics: the account holds initial_capital
+        # before the first recorded bar, so a loss on that bar is a drawdown too.
+        peak = equity_series.cummax().clip(lower=float(self.initial_capital))
         dd = (equity_series - peak) / peak.replace(0, 1)
         eq_df = pd.DataFrame({
             "ret": port_ret,
@@ -2044,21 +2430,28 @@ class BaseEngine(ABC):
         target_out.index.name = "timestamp"
         target_out.to_csv(out / "target_positions.csv")
 
-        # Trades (compatible format)
+        # Trades (compatible format): two rows per round trip, entry then exit.
+        # The entry row is the opening fill as executed. A TradeRecord's
+        # entry_price is the weighted cost after any scale-ins while its
+        # entry_time stays on the first open, so pairing those two would
+        # report a fill that never happened. Scale-ins stay in fills.jsonl.
         trade_rows = []
         for t in self.trades:
             # Entry event
+            entry_price = t.entry_price if t.open_price is None else t.open_price
+            entry_qty = t.size if t.open_size is None else t.open_size
             trade_rows.append({
                 "timestamp": str(t.entry_time.date()) if hasattr(t.entry_time, "date") else str(t.entry_time),
                 "code": t.symbol,
                 "side": "buy" if t.direction == 1 else "sell",
-                "price": round(t.entry_price, 4),
-                "qty": round(t.size, 6),
+                "price": entry_price,
+                "qty": round(entry_qty, 6),
                 "reason": "signal",
                 "pnl": 0.0,
                 "holding_days": 0,
                 "holding_bars": 0.0,
                 "return_pct": 0.0,
+                "event": "entry",
             })
             # Exit event
             try:
@@ -2069,18 +2462,19 @@ class BaseEngine(ABC):
                 "timestamp": str(t.exit_time.date()) if hasattr(t.exit_time, "date") else str(t.exit_time),
                 "code": t.symbol,
                 "side": "sell" if t.direction == 1 else "buy",
-                "price": round(t.exit_price, 4),
+                "price": t.exit_price,
                 "qty": round(t.size, 6),
                 "reason": t.exit_reason,
                 "pnl": round(t.pnl, 4),
                 "holding_days": hold_days,
                 "holding_bars": t.holding_bars,
                 "return_pct": round(t.pnl_pct, 2),
+                "event": "exit",
             })
 
         trade_cols = [
             "timestamp", "code", "side", "price", "qty", "reason", "pnl",
-            "holding_days", "holding_bars", "return_pct",
+            "holding_days", "holding_bars", "return_pct", "event",
         ]
         pd.DataFrame(trade_rows or [], columns=trade_cols).to_csv(out / "trades.csv", index=False)
 
@@ -2119,12 +2513,24 @@ class BaseEngine(ABC):
         _arr: "np.ndarray | None" = None,
         _row: "int | None" = None,
         _col: "int | None" = None,
+        _val_arr: "np.ndarray | None" = None,
     ) -> float:
-        """Get close price with fallback. Uses array fast-path when available."""
+        """Get close price with fallback. Uses array fast-path when available.
+
+        Valuation call sites pass ``_val_arr`` (unbounded ffill) so a halted
+        position marks at its last traded close instead of ``fallback`` once
+        the bounded matrix goes NaN past the ffill limit.
+        """
         # Fast path: pre-computed array indexing (O(1) vs DataFrame.at hash lookup)
         if _arr is not None and _row is not None and _col is not None:
             val = _arr[_row, _col]
-            return float(val) if not np.isnan(val) else fallback
+            if not np.isnan(val):
+                return float(val)
+            if _val_arr is not None:
+                vval = _val_arr[_row, _col]
+                if not np.isnan(vval):
+                    return float(vval)
+            return fallback
         # Original path (backward compatible for subclasses)
         if ts in close_df.index and symbol in close_df.columns:
             val = close_df.at[ts, symbol]

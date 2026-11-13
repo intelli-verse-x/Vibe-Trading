@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from threading import Lock
+from time import monotonic
 from typing import Mapping, Optional
 
 
@@ -37,6 +39,13 @@ class ProviderCapabilities:
             request to it succeed. Leave it False until then — the cost of False
             is that ``LANGCHAIN_REASONING_EFFORT`` has no effect there, and the
             cost of a wrong True is that every request fails.
+        reasoning_effort_models: Optional per-model scoping for
+            ``top_level_reasoning_effort``. ``None`` (the default) means every
+            model of the provider accepts the field; a tuple means only models
+            whose name starts with one of the entries do — prefixes, so
+            ``"kimi-k3.1-pro"`` also covers ``kimi-k3.1-pro-highspeed``. An
+            unmatched model is a no-op, not an error, mirroring the asymmetry
+            of the provider-level flag. Ignored when the flag is False.
         default_headers: Provider-scoped headers passed to ChatOpenAI.
         native_adapter_package: Optional native adapter package to report.
     """
@@ -50,6 +59,7 @@ class ProviderCapabilities:
     normalize_assistant_content: bool = False
     openrouter_reasoning_body: bool = False
     top_level_reasoning_effort: bool = False
+    reasoning_effort_models: tuple[str, ...] | None = None
     default_headers: Mapping[str, str] = field(default_factory=dict)
     native_adapter_package: Optional[str] = None
 
@@ -74,14 +84,36 @@ def _package_version() -> str:
 _VIBE_USER_AGENT = f"Vibe-Trading/{_package_version()}"
 
 
-@lru_cache(maxsize=1)
+_GH_CLI_TOKEN_TTL_SECONDS = 60.0
+_gh_cli_token_cache: tuple[float, str] | None = None
+_gh_cli_token_lock = Lock()
+
+
 def _gh_cli_token() -> str:
     """Return an explicit Copilot token; the SDK handles stored credentials."""
-    from src.providers.copilot_auth import resolve_copilot_token
+    global _gh_cli_token_cache
 
-    return resolve_copilot_token()[0]
+    with _gh_cli_token_lock:
+        now = monotonic()
+        if _gh_cli_token_cache is not None and now - _gh_cli_token_cache[0] < _GH_CLI_TOKEN_TTL_SECONDS:
+            return _gh_cli_token_cache[1]
+
+        from src.providers.copilot_auth import resolve_copilot_token
+
+        token = resolve_copilot_token()[0]
+        _gh_cli_token_cache = (monotonic(), token)
+        return token
 
 
+# Moonshot publishes a top-level ``reasoning_effort`` (low/high/max only —
+# there is no medium/minimal) for the kimi-k3.1 model family on its chat
+# completions endpoint: https://platform.kimi.ai/docs/guide/use-reasoning-effort.md
+# Enabled per published contract; live endpoint verification pending (no
+# Moonshot key available to contributor) — issue #2020. The model tuple scopes
+# the flag to kimi-k3.1*, and ``llm.py`` additionally gates on the official
+# api.moonshot.ai host, so a relayed ``MOONSHOT_BASE_URL`` receives nothing.
+# The "kimi" alias shares this record; kimi-coding serves a different endpoint
+# and stays off the allowlist.
 _MOONSHOT_CAPABILITIES = ProviderCapabilities(
     "moonshot",
     "MOONSHOT_API_KEY",
@@ -89,6 +121,8 @@ _MOONSHOT_CAPABILITIES = ProviderCapabilities(
     capture_reasoning=True,
     send_reasoning_content=True,
     normalize_assistant_content=True,
+    top_level_reasoning_effort=True,
+    reasoning_effort_models=("kimi-k3.1-pro",),
     default_headers={"User-Agent": _VIBE_USER_AGENT},
 )
 
@@ -108,6 +142,21 @@ _NVIDIA_CAPABILITIES = ProviderCapabilities(
     "nvidia",
     "NVIDIA_API_KEY",
     "NVIDIA_BASE_URL",
+    default_headers={"User-Agent": _VIBE_USER_AGENT},
+)
+
+
+# OpenCode Go / Zen relay (opencode.ai). Speaks the OpenAI wire format and
+# serves DeepSeek/GLM/Kimi models that stream ``reasoning_content``. OpenCode
+# Go additionally requires a stable per-conversation ``x-opencode-session``
+# header (400 ``MissingSessionID`` without it); that value depends on the
+# active session and is injected at request time in ``llm.py``. The
+# User-Agent is the client identification the service asks for.
+_OPENCODE_CAPABILITIES = ProviderCapabilities(
+    "opencode",
+    "OPENCODE_API_KEY",
+    "OPENCODE_BASE_URL",
+    capture_reasoning=True,
     default_headers={"User-Agent": _VIBE_USER_AGENT},
 )
 
@@ -131,9 +180,7 @@ _SPARK_CAPABILITIES = ProviderCapabilities(
     "SPARK_BASE_URL",
 )
 
-_OPENAI_CODEX_CAPABILITIES = ProviderCapabilities(
-    "openai-codex", None, "OPENAI_CODEX_BASE_URL"
-)
+_OPENAI_CODEX_CAPABILITIES = ProviderCapabilities("openai-codex", None, "OPENAI_CODEX_BASE_URL")
 
 # GitHub Copilot is routed through the official SDK in ``build_llm``.
 _COPILOT_CAPABILITIES = ProviderCapabilities(
@@ -141,6 +188,12 @@ _COPILOT_CAPABILITIES = ProviderCapabilities(
     "COPILOT_GITHUB_TOKEN",
     "COPILOT_BASE_URL",
 )
+
+
+# The local Claude Code CLI is driven as a subprocess in ``build_llm``; it has
+# no HTTP endpoint or key of its own. The base-URL variable is never read — the
+# settings UI requires one per provider.
+_CLAUDE_CLI_CAPABILITIES = ProviderCapabilities("claude-cli", None, "CLAUDE_CLI_BASE_URL")
 
 
 _PROVIDERS: dict[str, ProviderCapabilities] = {
@@ -165,16 +218,6 @@ _PROVIDERS: dict[str, ProviderCapabilities] = {
         "openrouter",
         "OPENROUTER_API_KEY",
         "OPENROUTER_BASE_URL",
-        capture_reasoning=True,
-        openrouter_reasoning_body=True,
-    ),
-    # Requesty is an OpenAI-compatible LLM gateway using the same
-    # ``provider/model`` naming and the same opt-in ``extra_body.reasoning``
-    # request option as OpenRouter, so it shares OpenRouter's capability shape.
-    "requesty": ProviderCapabilities(
-        "requesty",
-        "REQUESTY_API_KEY",
-        "REQUESTY_BASE_URL",
         capture_reasoning=True,
         openrouter_reasoning_body=True,
     ),
@@ -212,9 +255,7 @@ _PROVIDERS: dict[str, ProviderCapabilities] = {
     # naming. The v1 chat path exposes no reasoning fields, so no capability
     # flags are set and it rides the generic OpenAI-compatible path.
     "novita": ProviderCapabilities("novita", "NOVITA_API_KEY", "NOVITA_BASE_URL"),
-    "dashscope": ProviderCapabilities(
-        "dashscope", "DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL"
-    ),
+    "dashscope": ProviderCapabilities("dashscope", "DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL"),
     "qwen": ProviderCapabilities("qwen", "DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL"),
     "zhipu": _ZHIPU_CAPABILITIES,
     "glm": _ZHIPU_CAPABILITIES,
@@ -234,14 +275,12 @@ _PROVIDERS: dict[str, ProviderCapabilities] = {
     "ollama": ProviderCapabilities("ollama", None, "OLLAMA_BASE_URL"),
     "copilot": _COPILOT_CAPABILITIES,
     "github-copilot": _COPILOT_CAPABILITIES,
+    "claude-cli": _CLAUDE_CLI_CAPABILITIES,
     "openai-codex": _OPENAI_CODEX_CAPABILITIES,
     "openai_codex": _OPENAI_CODEX_CAPABILITIES,
-    "opencode-zen": ProviderCapabilities(
-        "opencode-zen", "OPENAI_API_KEY", "OPENAI_BASE_URL"
-    ),
-    "opencode-go": ProviderCapabilities(
-        "opencode-go", "OPENAI_API_KEY", "OPENAI_BASE_URL"
-    ),
+    "opencode": _OPENCODE_CAPABILITIES,
+    "opencode-zen": ProviderCapabilities("opencode-zen", "OPENAI_API_KEY", "OPENAI_BASE_URL"),
+    "opencode-go": ProviderCapabilities("opencode-go", "OPENAI_API_KEY", "OPENAI_BASE_URL"),
 }
 
 
@@ -278,10 +317,21 @@ def get_provider_capabilities(
     Notes:
         Model-name inference (``_infer_from_model``) activates for the default
         ``"openai"`` provider and empty/None providers. Explicit non-OpenAI
-        providers (OpenRouter, Requesty, DeepSeek, etc.) are never inferred —
+        providers (OpenRouter, DeepSeek, etc.) are never inferred —
         the explicit provider choice always wins.
     """
     normalized = (provider or "").strip().lower().replace("_", "-")
+    if normalized == "custom":
+        return ProviderCapabilities("custom", None, "OPENAI_BASE_URL", capture_reasoning=True)
+    if normalized == "minimax" and model == "MiniMax-M3.1-Flash":
+        # Flash returns reasoning separately and requires it on subsequent tool turns.
+        return ProviderCapabilities(
+            "minimax",
+            "MINIMAX_API_KEY",
+            "MINIMAX_BASE_URL",
+            capture_reasoning=True,
+            send_reasoning_content=True,
+        )
     if normalized == "openai-codex":
         return _PROVIDERS["openai-codex"]
     if normalized and normalized != "openai":
@@ -292,9 +342,7 @@ def get_provider_capabilities(
     return _PROVIDERS.get(normalized, _PROVIDERS["openai"])
 
 
-def provider_env_names(
-    provider: str | None, model: str | None = None
-) -> tuple[str | None, str]:
+def provider_env_names(provider: str | None, model: str | None = None) -> tuple[str | None, str]:
     """Return the API-key and base-URL env names for a provider/model pair."""
     caps = get_provider_capabilities(provider, model)
     return caps.api_key_env, caps.base_url_env
@@ -362,6 +410,13 @@ def get_llm_credentials(
         preflight, environment synchronization, and runtime construction all
         consume the same endpoint.
     """
+    normalized_provider = (provider or "").strip().lower().replace("_", "-")
+    if normalized_provider == "custom":
+        from src.providers.custom_profiles import active_provider_credentials
+
+        active = active_provider_credentials()
+        return {"provider": "custom", **active}
+
     caps = get_provider_capabilities(provider, model)
     key_env, base_env = caps.api_key_env, caps.base_url_env
 

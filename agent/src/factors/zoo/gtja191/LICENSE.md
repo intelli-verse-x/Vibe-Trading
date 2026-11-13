@@ -4,21 +4,19 @@
 
 ## Source
 
-国泰君安证券 (Guotai Junan Securities) 2014 research report
-*"191 个短周期交易型 alpha 因子" — 191 Short-Period Transactional Alpha Factors*.
-The report is part of Guotai Junan's published Chinese-A-share quantitative research series
-and was distributed publicly through the firm's research portal and partner channels.
+国泰君安证券 (Guotai Junan Securities),
+*基于短周期价量特征的多因子选股体系——数量化专题之九十三*,
+2017-06-15. The appendix lists the 191 alpha formulas.
+[Public copy of the original report](https://guorn.com/static/upload/file/3/134065454575605.pdf).
 
 ## Authors
 
-The report is attributed to the Guotai Junan quantitative research team. Where
-individual author names appear on the cover page (光辉 / Guang Hui and 彭祖虎 /
-Peng Zuhu in some circulating copies), they are credited to the original work;
-this repository does not claim derived authorship of the formulas themselves.
+李辰 (Li Chen) and 刘富兵 (Liu Fubing), as credited on the report cover.
+This repository does not claim authorship of the formulas.
 
 ## Year
 
-2014.
+2017.
 
 ## What is reproduced here
 
@@ -57,24 +55,33 @@ In every such case, we picked the closest semantically faithful alternative
 **and documented the choice in the alpha's `__alpha_meta__["notes"]` field**.
 The most common substitutions:
 
-- `WMA(x, n)` — the original report uses a specific weighted moving average with
-  weights `0.9, 0.9², …`. We approximate with `decay_linear(x, n)` (linearly
-  decaying weights), noted in affected alphas (e.g. gtja191_009, gtja191_039,
-  gtja191_047).
+- `WMA(x, n)` uses normalized `0.9**age` weights in `base.geometric_wma`;
+  alphas 27 and 30 use that operator rather than DECAYLINEAR.
 - `SMA(x, n, m)` — Wilder-style EMA with explicit `m/n` smoothing — mapped to
   `x.ewm(alpha=m/n, adjust=False).mean()` (pandas), documented per-alpha when
   used.
-- `REGBETA(x, y, n)` and `REGRESI(x, y, n)` — rolling OLS slope and residual
-  are approximated as `ts_cov(x, y, n) / ts_std(y, n) ** 2` (slope) and
-  `x - beta * y` (residual). Affected alphas note this explicitly.
-- `FILTER(x, cond)` — implemented as `x.where(cond, np.nan)` so unmet rows
-  propagate NaN rather than silently zero-fill.
+- Alpha 149 applies FILTER before fitting an OLS slope with an intercept to
+  252 benchmark-down observations. Unselected dates are removed, not zero-filled;
+  the last slope is carried until another selected observation arrives. Missing
+  selected stock returns invalidate their whole selected window; an unknown
+  benchmark direction clears selection history. The calendar minimum of 253
+  closes is only a lower bound, not a promise of 252 down observations.
+- Alpha 30 requires observed `mkt_ret`, `smb` and `hml` panels: complete 60-row
+  multifactor OLS with an intercept, current residual squared, then 20-row WMA.
+  Missing factor inputs no longer become a squared-return proxy.
 - `SUMIF(x, cond, n)` — implemented as `(x * cond).rolling(n).sum()` with
   boolean → float coercion documented where it appears.
-- `HIGHDAY` / `LOWDAY` use `ts_argmax` / `ts_argmin` with **0-based** positions
-  inside the window (vs. the report's 1-based convention); a `(n - argmax)`-style
-  re-base is applied where the formula's downstream arithmetic depends on the
-  count rather than the index.
+- `HIGHDAY` / `LOWDAY` — the operator table on report page 31 defines
+  the distance from the extreme to the current bar, so today is 0 and the
+  oldest bar in an n-bar window is n-1. For a 0-based index `i` measured from
+  the oldest bar, days-since is `(n - 1) - i`, not `n - i`. Thus alphas 103
+  (page 14) and 177 (page 16) range from 5 to 100 for n=20; alpha 133
+  (page 15) subtracts the low-recency score from the high-recency score.
+  The report does not specify ties. These three ports explicitly choose
+  the **most recent** tied extreme, independently of optional acceleration.
+  The original table repeats “maximum” on the LOWDAY row; LOWDAY is interpreted
+  as the minimum, consistent with its name and the low-price formula.
+
 
 When a benchmark index series (`benchmark_close`) is referenced by the original
 formula but unavailable in this panel, we fall back to the per-day
@@ -92,5 +99,17 @@ the look-ahead guard in `tests/factors/test_lookahead.py` (no `Ref(x, -n)`,
 ## Display name and citation
 
 When citing this re-implementation, please reference:
-- Guotai Junan Securities, "191 个短周期交易型 alpha 因子", 2014.
+- Li Chen and Liu Fubing, Guotai Junan Securities,
+  "基于短周期价量特征的多因子选股体系——数量化专题之九十三", 2017-06-15.
 - The display name **"GTJA Alpha 191"** for the directory in this repository.
+
+## History contracts
+
+All bundled factors have source-pinned minimum-history contracts in
+`src/factors/warmup_contracts.json`. A complete n-row operator adds n-1 to its
+input history; delays add their lag. Recursive SMA/EMA initializes at the first
+observed input and keeps the established skip-and-continue gap policy. The
+registry removes the initial ineligible prefix after these declarations are
+reconciled; it does not rewarm recursive statistics after a missing bar.
+The Research Lab audit checks these contracts on synthetic input, not alpha
+profitability or universal equivalence of every formula interpretation.

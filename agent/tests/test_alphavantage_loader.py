@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from backtest.loaders import alphavantage_loader as av
+from tests.loader_contract import assert_loader_contract
 
 
 def _payload(*dates_rows) -> dict:
@@ -75,6 +76,7 @@ class TestFetch:
         df = out["AAPL"]
         assert list(df.columns) == ["open", "high", "low", "close", "volume"]
         assert df.index.name == "trade_date"
+        assert_loader_contract(df, context="canonical frame")
         assert isinstance(df.index, pd.DatetimeIndex)
         assert df.index.is_monotonic_increasing
         assert all(df[col].dtype == float for col in df.columns)
@@ -105,6 +107,15 @@ class TestFetch:
             av.DataLoader().fetch(["aapl"], "2024-01-01", "2024-01-31")
         _, kwargs = mock_get.call_args
         assert kwargs["params"]["symbol"] == "AAPL"
+
+    def test_project_us_suffix_is_stripped_for_the_request(self, monkeypatch):
+        monkeypatch.setenv("ALPHAVANTAGE_API_KEY", "ABC123")
+        payload = _payload(("2024-01-02", 1, 1, 1, 1, 1))
+        with patch.object(av, "throttled_get_json", return_value=payload) as mock_get:
+            out = av.DataLoader().fetch(["AAPL.US"], "2024-01-01", "2024-01-31")
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"]["symbol"] == "AAPL"
+        assert set(out) == {"AAPL.US"}
 
     def test_no_key_returns_empty_without_http(self):
         with patch.object(av, "throttled_get_json") as mock_get:

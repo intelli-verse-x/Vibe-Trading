@@ -41,6 +41,7 @@ from backtest.loaders.futu import (  # noqa: E402
     _to_futu_symbol,
     _to_futu_ktype,
 )
+from tests.loader_contract import assert_loader_contract
 from backtest.loaders.base import NoAvailableSourceError  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,16 @@ class TestSymbolMapping:
 
     def test_case_insensitive(self):
         assert _to_futu_symbol("700.hk") == "HK.00700"
+
+    def test_us_suffix(self):
+        assert _to_futu_symbol("SMCI.US") == "US.SMCI"
+        assert _to_futu_symbol("brk.b.us") == "US.BRK.B"
+
+    def test_bare_ticker_is_us(self):
+        assert _to_futu_symbol("SPY") == "US.SPY"
+
+    def test_bare_non_us_code_is_not_us(self):
+        assert _to_futu_symbol("600519") == "600519"
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +244,7 @@ class TestFetch:
         df = result["700.HK"]
         assert list(df.columns) == ["open", "high", "low", "close", "volume"]
         assert df.index.name == "trade_date"
+        assert_loader_contract(df, context="canonical frame")
 
     def test_futu_symbol_converted_correctly(self, loader, mock_ctx):
         mock_ctx.request_history_kline.return_value = (0, _make_kline_df(), None)

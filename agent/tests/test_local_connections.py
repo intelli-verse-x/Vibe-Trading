@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -37,7 +38,8 @@ def test_connection_registry_never_serializes_credentials(tmp_path):
     payload = (tmp_path / "connections.json").read_text(encoding="utf-8")
     assert "secret-value" not in payload
     assert connection.credential_ref == "keyring://vibe-trading/main-binance"
-    assert (tmp_path / "connections.json").stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert (tmp_path / "connections.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_connection_registry_normalizes_ids_before_duplicate_checks(tmp_path):
@@ -244,9 +246,9 @@ def test_connection_scoped_overrides_obey_the_connector_allowlist(tmp_path, monk
     """A vault-backed call must not widen what a caller may override.
 
     Every SDK connector narrows overrides on purpose: OKX and Binance both
-    exclude ``readonly`` ("always true for this layer") and ``timeout``, and
-    Longbridge's overlay is ``profile``/``region`` only so a caller "cannot mix
-    or bypass the shared resolver". ``build_config`` enforces that; a config
+    exclude ``readonly`` and ``timeout``, and Longbridge's overlay is
+    ``profile``/``region`` only so a caller "cannot mix or bypass the shared
+    resolver". ``build_config`` enforces that; a config
     built from a raw merged mapping would not — and ``overrides`` is the one
     part of that payload that arrives from an MCP tool argument or REST body.
     """

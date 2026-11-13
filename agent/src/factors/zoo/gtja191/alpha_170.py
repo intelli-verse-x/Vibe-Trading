@@ -40,13 +40,13 @@ ALPHA_ID = "gtja191_170"
 __alpha_meta__ = {
     'id': 'gtja191_170',
     'theme': ['volume'],
-    'formula_latex': 'see body',
+    'formula_latex': '((((RANK((1/CLOSE))*VOLUME)/MEAN(VOLUME,20)) * ((HIGH * RANK((HIGH-CLOSE))) / (SUM(HIGH,5)/5))) - RANK((VWAP - DELAY(VWAP,5))))',
     'columns_required': ['open', 'high', 'low', 'close', 'volume', 'amount'],
     'extras_required': [],
     'universe': ['equity_cn'],
     'frequency': ['1d'],
     'decay_horizon': 20,
-    'min_warmup_bars': 21,
+    'min_warmup_bars': 20,
     'notes': '',
 }
 
@@ -66,7 +66,7 @@ def compute(panel):
     vw = vwap(panel, "equity_cn")
 
     a = safe_div(rank(safe_div(pd.DataFrame(1.0, index=c.index, columns=c.columns), c)) * v, ts_mean(v, 20))
-    b = safe_div(h * rank(h - c), c.rolling(5).sum() / 5.0)
+    b = safe_div(h * rank(h - c), h.rolling(5).sum() / 5.0)
     d = rank(vw - vw.shift(5))
     out = a * b - d
     return out

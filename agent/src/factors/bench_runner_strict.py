@@ -51,7 +51,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterable, Literal, Mapping
 
 import numpy as np
 import pandas as pd
@@ -63,7 +63,16 @@ from src.factors.registry import (
     SkipAlpha,
     get_default_registry,
 )
-from src.tools.alpha_bench_tool import _compute_forward_returns, _load_universe_panel
+from src.factors.data_availability import build_availability_contract
+from src.factors.research_contract import build_bench_research_contract
+from src.tools.alpha_bench_tool import (
+    _MAX_HORIZON,
+    _compute_forward_returns,
+    _load_universe_panel,
+    _prepare_bench_panel,
+    _split_alphas_by_universe_support,
+    _validate_bench_data_requirements,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -322,10 +331,16 @@ def run_bench_strict(
     random_control: bool,
     n_random_seeds: int = 5,
     oos_split: str | None = None,
+    training_cutoff: str | None = None,
     thresholds: StrictThresholds | None = None,
     top: int = 20,
+    horizon: int = 1,
     on_progress: ProgressCb | None = None,
     registry: Registry | None = None,
+    research_mode: str = "strict",
+    research_stage: str = "single_factor_evaluation",
+    research_lineage: Iterable[str | Mapping[str, Any]] | None = None,
+    research_transformations: Iterable[str | Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Strict-mode bench: like ``run_bench`` but with mandatory random control.
 
@@ -343,15 +358,28 @@ def run_bench_strict(
             values shrink the random IC variance and tighten the alpha
             t-stat; default 5 is enough for a 455-alpha zoo without making
             the bench more than ~6x slower.
-        oos_split: Date string (``YYYY-MM-DD``) splitting train and test.
-            ``None`` disables the OOS gate (full sample only).
+        oos_split: Date string splitting train and test.
+            ``None`` disables the OOS gate unless ``training_cutoff`` is set.
+        training_cutoff: Model training cutoff; test observations must be later.
         thresholds: ``StrictThresholds`` instance. Defaults to
             ``alpha_t_threshold=2.0`` (back-compat). Pass ``3.5`` to apply
             Harvey-Liu-Zhu (2016) multiple-testing correction when bench
             covers a large zoo.
         top: How many top-IR alphas to keep in summary lists.
+        horizon: Forward-return horizon in bars (default 1 = next-bar,
+            unchanged behaviour). ``h > 1`` computes h-bar forward returns
+            sampled non-overlapping (end-anchored) so the naive-iid t-stats
+            stay honest; 21 ≈ monthly, the conventional horizon for
+            fundamental factors.
         on_progress: Optional ``(n_done, n_total, alpha_id)`` callback.
         registry: Optional pre-built registry for tests.
+        research_mode: Declared evidence mode for the additive research
+            contract. It is metadata only and does not change strict bench
+            statistics.
+        research_stage: Stage name recorded in the research contract.
+        research_lineage: Optional structured inputs for artifact lineage.
+        research_transformations: Optional transformations applied before the
+            bench.
 
     Returns:
         Dict containing all the keys ``run_bench()`` returns, plus:
@@ -387,14 +415,22 @@ def run_bench_strict(
     # Initialise the full schema up-front so even early-error returns
     # carry zeroed counters and empty lists — downstream consumers can
     # depend on the keys always being present.
+    effective_oos_split = training_cutoff if training_cutoff is not None else oos_split
     entry: dict[str, Any] = {
         "status": "pending",
         "zoo": zoo,
         "universe": universe,
         "period": period,
+        "horizon": horizon,
+        "forward_return_sampling": (
+            "non_overlapping"
+            if isinstance(horizon, int) and not isinstance(horizon, bool) and horizon > 1
+            else "daily"
+        ),
         "random_control": random_control,
         "n_random_seeds": effective_seeds,
-        "oos_split": oos_split,
+        "oos_split": effective_oos_split,
+        "training_cutoff": training_cutoff,
         "alpha_t_threshold": thresholds.alpha_t_threshold,
         "n_alphas_tested": 0,
         "n_skipped": 0,
@@ -423,18 +459,45 @@ def run_bench_strict(
         entry["wall_seconds"] = round(time.monotonic() - start, 2)
         return entry
 
+    if training_cutoff is not None and oos_split is not None:
+        return _finish_error("pass either training_cutoff or oos_split, not both")
+
+    # Fail fast before any panel load (network): same 1.._MAX_HORIZON contract
+    # the tool and MCP wrapper enforce.
+    if isinstance(horizon, bool) or not isinstance(horizon, int) or not 1 <= horizon <= _MAX_HORIZON:
+        return _finish_error(
+            f"horizon must be an integer between 1 and {_MAX_HORIZON}, got {horizon!r}"
+        )
+
     reg = registry if registry is not None else get_default_registry()
     alpha_ids = reg.list(zoo=zoo)
     if not alpha_ids:
         return _finish_error(f"no alphas registered under zoo={zoo!r}")
 
+    # Same selection and panel preparation as ``run_bench``: exclude ``fund:``
+    # alphas a non-sp500 universe cannot serve, and attach the SEC ``fund:``,
+    # tushare ``val:`` and csi300 ``sector`` inputs the cached panel omits.
+    alpha_ids, universe_excluded = _split_alphas_by_universe_support(
+        reg, alpha_ids, universe
+    )
+    if universe_excluded:
+        entry["universe_excluded"] = universe_excluded
+    if not alpha_ids:
+        return _finish_error(
+            f"all {len(universe_excluded)} selected alphas require SEC US filings "
+            f"(fund:* inputs); the {universe!r} universe cannot serve them. "
+            "Choose the S&P 500 universe."
+        )
+
     try:
+        _validate_bench_data_requirements(reg, alpha_ids, universe)
         panel = _load_universe_panel(universe, period)
     except (ValueError, NotImplementedError, RuntimeError) as exc:
         return _finish_error(f"universe load failed: {exc}")
 
     try:
-        return_df = _compute_forward_returns(panel)
+        panel = _prepare_bench_panel(reg, alpha_ids, panel, universe, period)
+        return_df = _compute_forward_returns(panel, horizon=horizon)
     except Exception as exc:  # noqa: BLE001
         return _finish_error(f"forward returns failed: {exc}")
 
@@ -443,11 +506,21 @@ def run_bench_strict(
     n_total = len(alpha_ids)
 
     oos_ts: pd.Timestamp | None = None
-    if oos_split is not None:
+    if effective_oos_split is not None:
         try:
-            oos_ts = pd.Timestamp(oos_split)
+            oos_ts = pd.Timestamp(effective_oos_split)
         except (TypeError, ValueError) as exc:
-            return _finish_error(f"invalid oos_split {oos_split!r}: {exc}")
+            return _finish_error(f"invalid OOS boundary {effective_oos_split!r}: {exc}")
+        close = panel.get("close")
+        if close is not None and len(close.index):
+            first = pd.Timestamp(close.index.min())
+            last = pd.Timestamp(close.index.max())
+            if not first <= oos_ts < last:
+                return _finish_error(
+                    f"OOS boundary {effective_oos_split!r} must fall within the "
+                    "loaded sample "
+                    f"[{first.date()}, {last.date()})"
+                )
 
     def _fire_progress(idx: int, aid: str) -> None:
         if on_progress is None:
@@ -461,10 +534,14 @@ def run_bench_strict(
         try:
             factor_df = reg.compute(aid, panel)
             signal_ic = compute_ic_series(factor_df, return_df)
-            if signal_ic.empty:
-                skipped.append(
-                    {"id": aid, "reason": "empty IC series", "kind": "typed"}
+            if len(signal_ic) < 2:
+                # ddof=1 std of one IC is NaN; match bench_runner's guard.
+                reason = (
+                    "empty IC series"
+                    if signal_ic.empty
+                    else "insufficient IC observations (need at least 2)"
                 )
+                skipped.append({"id": aid, "reason": reason, "kind": "typed"})
                 _fire_progress(idx, aid)
                 continue
 
@@ -496,6 +573,16 @@ def run_bench_strict(
                 alpha_t_test = t_stat(test_slice)
                 ic_count_train = int(len(train_slice))
                 ic_count_test = int(len(test_slice))
+                # t_stat reads fewer than two observations as 0.0, so an empty
+                # side would be categorised as if it had been measured. The
+                # sample-range check above cannot see this: the IC series
+                # starts after the alpha's warmup and ends a forward-return
+                # horizon before the last price.
+                if min(ic_count_train, ic_count_test) < 2:
+                    raise SkipAlpha(
+                        f"OOS boundary {effective_oos_split} leaves {ic_count_train} train / "
+                        f"{ic_count_test} test IC observations; each side needs 2"
+                    )
 
             meta = reg.get(aid).meta or {}
             ic_mean = float(signal_ic.mean())
@@ -582,6 +669,33 @@ def run_bench_strict(
         except Exception:  # noqa: BLE001
             universe_meta = {"raw": str(universe_meta_raw)}
 
+    required_fields = sorted(
+        {
+            str(column)
+            for aid in alpha_ids
+            for column in (reg.get(aid).meta or {}).get("columns_required", [])
+        }
+    )
+    universe_meta["data_availability"] = build_availability_contract(
+        panel,
+        universe=universe,
+        period=period,
+        required_fields=required_fields,
+    )
+    universe_meta["research"] = build_bench_research_contract(
+        mode=research_mode,
+        stage=research_stage,
+        universe=universe,
+        period=period,
+        factor_ids=alpha_ids,
+        zoo=zoo,
+        lineage=research_lineage,
+        transformations=research_transformations,
+        horizon=horizon,
+        method="paired_random_control" if random_control else "rank_ic",
+        oos_boundary=effective_oos_split,
+    )
+
     # Strip the underscore-prefixed sort helper keys from the wire-bound
     # row payloads so they never appear in JSON responses or persisted
     # results. Keep the rest of the row schema as-is so dashboards see
@@ -602,6 +716,13 @@ def run_bench_strict(
     legacy_dead = counts["noise"] + counts["train_only"]
 
     by_theme = _theme_breakdown_strict(rows)
+
+    if effective_oos_split is not None and not rows:
+        entry["n_skipped"] = len(skipped)
+        entry["skipped"] = skipped
+        return _finish_error(
+            "OOS benchmark produced no valid alpha rows; inspect skipped reasons"
+        )
 
     entry.update(
         {

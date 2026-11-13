@@ -825,6 +825,36 @@ def test_enterprise_value_finite_bridge_is_unchanged():
     assert result.enterprise_value == pytest.approx(280.0, abs=EXACT)
 
 
+def test_enterprise_value_refuses_negative_bridge_magnitudes():
+    # A negative magnitude here would silently flip the sign the bridge
+    # applies (e.g. negative cash gets ADDED to EV instead of subtracted).
+    with pytest.raises(ValuationError):
+        enterprise_value(market_cap=1000.0, total_debt=200.0, cash_and_equivalents=-150.0)
+    with pytest.raises(ValuationError):
+        enterprise_value(market_cap=1000.0, total_debt=-200.0, cash_and_equivalents=150.0)
+    with pytest.raises(ValuationError):
+        enterprise_value(
+            market_cap=1000.0,
+            total_debt=200.0,
+            cash_and_equivalents=150.0,
+            minority_interest=-50.0,
+        )
+    with pytest.raises(ValuationError):
+        enterprise_value(
+            market_cap=1000.0,
+            total_debt=200.0,
+            cash_and_equivalents=150.0,
+            preferred_stock=-50.0,
+        )
+    with pytest.raises(ValuationError):
+        enterprise_value(
+            market_cap=1000.0,
+            total_debt=200.0,
+            cash_and_equivalents=150.0,
+            investments_in_associates=-50.0,
+        )
+
+
 def test_calendarise_metric_refuses_non_finite_period_values():
     with pytest.raises(ValuationError):
         calendarise_metric(
@@ -849,3 +879,13 @@ def test_calendarise_metric_finite_ltm_is_unchanged():
         "ltm", metric_name="ebitda", company_name="X",
     )
     assert result.value == pytest.approx(110.0, abs=EXACT)
+
+
+@pytest.mark.parametrize("book", [float("nan"), float("inf"), float("-inf")])
+def test_target_non_finite_book_value_is_rejected(book):
+    with pytest.raises(ValuationError, match="book_value_of_equity"):
+        _baseline_target(book_value_of_equity=book)
+
+
+def test_target_negative_book_value_is_still_accepted():
+    assert _baseline_target(book_value_of_equity=-50.0).book_value_of_equity == -50.0

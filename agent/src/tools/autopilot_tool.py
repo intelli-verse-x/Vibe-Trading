@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from src.agent.tools import BaseTool
+from src.tools._arguments import boolean_argument
+from src.config.paths import get_runs_dir
 from src.hypotheses import HypothesisRegistry
 
 
@@ -250,7 +252,7 @@ def _validate_backtest_dates(start_date: str, end_date: str) -> None:
 def _run_dir_for_hypothesis(hypothesis_id: str) -> Path:
     """Return a path-contained run directory for any persisted hypothesis id."""
     suffix = hashlib.sha256(hypothesis_id.encode("utf-8")).hexdigest()[:12]
-    return Path.home() / ".vibe-trading" / "runs" / f"autopilot_{suffix}"
+    return get_runs_dir() / f"autopilot_{suffix}"
 
 
 class GenerateBacktestConfigTool(BaseTool):
@@ -491,7 +493,7 @@ class ScaffoldSignalEngineTool(BaseTool):
                     ensure_ascii=False,
                 )
 
-            overwrite = bool(kwargs.get("overwrite", False))
+            overwrite = boolean_argument(kwargs.get("overwrite", False), field="overwrite")
             code_dir = run_path / "code"
             code_dir.mkdir(parents=True, exist_ok=True)
             signal_path = code_dir / "signal_engine.py"

@@ -3,8 +3,11 @@
 Market rules:
   - T+1: cannot sell shares bought today
   - No short selling for retail investors
-  - Price limits: ±10% main board, ±20% ChiNext/STAR, ±5% ST
-  - Minimum lot: 100 shares (odd lots can only be sold, not bought)
+  - Ordinary price limits: ±10% main board, ±20% ChiNext/STAR, ±30% Beijing
+    (ST status and listing-day exemptions cannot be inferred from code alone)
+  - Order size: 100-share lots on the main board and ChiNext; at least 200
+    shares on the STAR Market and 100 on the Beijing exchange, then 1-share
+    steps (odd lots can only be sold, not bought)
   - Commission: ¥5 minimum, 0.025% bilateral
   - Stamp tax: 0.05% sell-side only
   - Transfer fee: 0.001% bilateral
@@ -51,8 +54,10 @@ class ChinaAEngine(BaseEngine):
         return china_a_can_execute(self, self, symbol, direction, bar)
 
     def round_size(self, raw_size: float, price: float) -> float:
-        """Round down to 100-share lots."""
-        return max(int(raw_size / 100) * 100, 0)
+        """Round down to the order-size grid of the active symbol's board."""
+        minimum, step = _order_grid(self._active_symbol)
+        size = int(raw_size / step) * step
+        return size if size >= minimum else 0
 
     def calc_commission(self, size: float, price: float, _direction: int, is_open: bool) -> float:
         """A-share fee structure: commission + stamp tax (sell) + transfer fee.
@@ -161,18 +166,38 @@ def _price_limit(symbol: str) -> float:
         symbol: Stock code (e.g. 300001.SZ, 688001.SH, 000001.SZ).
 
     Returns:
-        Limit as fraction (0.10, 0.20, or 0.05).
+        Ordinary board limit as fraction (0.10, 0.20, or 0.30).
     """
     code = symbol.split(".")[0] if "." in symbol else symbol
-    # ChiNext (300xxx) / STAR (688xxx): ±20%
-    if code.startswith("300") or code.startswith("688"):
+    # ChiNext (300xxx/301xxx) / STAR (688xxx, 689xxx CDRs): ±20%
+    if code.startswith(("300", "301", "688", "689")):
         return 0.20
-    # ST stocks: ±5% (heuristic: can't fully detect from code alone)
-    # Beijing exchange (8xxxxx): ±30% — simplified to 0.30
-    if code.startswith("8") and len(code) == 6:
+    # Beijing exchange: ±30%. Current codes are 920xxx; legacy 4xxxxx/8xxxxx
+    # codes remain in historical data.
+    if len(code) == 6 and code.startswith(("4", "8", "920")):
         return 0.30
     # Main board: ±10%
     return 0.10
+
+
+def _order_grid(symbol: str) -> tuple[int, int]:
+    """Smallest buy order and its step, in shares, on the symbol's board.
+
+    Args:
+        symbol: Stock code (e.g. 600000.SH, 688001.SH, 830799.BJ).
+
+    Returns:
+        ``(minimum, step)``. The STAR Market (688xxx, 689xxx CDRs) takes at
+        least 200 shares and the Beijing exchange at least 100, each then in
+        1-share steps; the main board and ChiNext trade 100-share lots.
+    """
+    code = symbol.split(".")[0] if "." in symbol else symbol
+    if code.startswith(("688", "689")):
+        return 200, 1
+    # Same Beijing code ranges as _price_limit.
+    if len(code) == 6 and code.startswith(("4", "8", "920")):
+        return 100, 1
+    return 100, 100
 
 
 def china_a_can_execute(state, rules, symbol: str, direction: int, bar: pd.Series) -> bool:

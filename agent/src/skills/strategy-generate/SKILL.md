@@ -11,10 +11,18 @@ category: strategy
 3. **Strategy coding**: write `code/signal_engine.py` (following the `SignalEngine` contract)
 4. **Syntax check**: `bash("python -c \"import ast; ast.parse(open('code/signal_engine.py').read()); print('OK')\"")`
 5. **Run backtest**: call the `backtest` tool (built into the engine; no need to write `run_backtest.py`)
-6. **Evaluate results**: read `artifacts/metrics.csv` and judge by the review criteria
-7. **Iterative fixing**: if results are poor, modify with `edit_file` → run `backtest` → re-evaluate
+6. **Evaluate results**: use the backtest tool's structured metrics, validation and artifact summary. Read `artifacts/metrics.csv` or targeted rows with `read_run_artifact` only when the requested evidence is missing from that summary. Judge by the review criteria and report failures honestly.
+7. **Fix implementation errors**: repair code/contract errors and rerun to verify. Poor returns in a correctly implemented strategy are a valid result: report them and stop. Change the strategy or test additional candidates only when the user requested optimization or comparison, within their specified scope. Deeper attribution and robustness research are performed when requested, not added to every backtest.
 
 **You only need to write `signal_engine.py` and `config.json`. The `backtest` tool automatically handles data loading and backtest execution.**
+
+## Adapting a registered strategy
+
+1. Read `get_strategy_evidence(strategy_id="sdm:...")` for the parent's description and computed regime definitions. A stale, disabled, decayed or inadequately evidenced parent cannot be adapted.
+2. Call `adapt_strategy(strategy_id=..., name=..., universe=..., config=...)` with explicit codes and date window. Only name, universe and optional position sizing may change. Signal definition, entry and exit rules remain the parent's. Missing inputs require a question, never a fabricated metric or threshold.
+3. Use the returned assigned `run_dir` and seeded `config.json`. Generate the child's `code/signal_engine.py` from its description using the contract below; never copy a parent run's metrics. Preserve the bound codes, dates and `strategy_adaptation` metadata. Record model provenance through the normal write tool.
+4. Call `backtest(run_dir=...)`, inspect its artifacts, then `refresh_strategy_evidence(runs=[{"strategy_id": "sdm:<child>", "run_dir": "<assigned>"}], scope="strategies")`. This updates only successful named strategies and preserves the parent's evidence. Refresh refuses a different run or changed config/code/results against the run card.
+5. Read the child's evidence and report its actual quality, cost and decay warnings. A successful backtest is not adequate regime evidence or independent approval. An unchanged mathematical signal can legitimately generate identical code for another universe; hashes establish provenance, not semantic correctness of generated Python.
 
 ## Requirements Parsing
 
@@ -69,6 +77,7 @@ class SignalEngine:
 - Do not include an `if __name__ == "__main__"` block
 - Pure pandas / numpy implementation, with no external signal libraries
 - Output plain Python code, not Markdown fences
+- Set each bar's signal from data up to that bar's close, and do not shift it yourself. The engine already delays signals by one bar: a signal set on bar `t` is filled at the open of bar `t+1`. A strategy that shifts its own signal (`.shift(1)`, or `signal[i]` taken from the condition at `i - 1`) fills every trade one bar later than intended, even when a "next open" rule is described
 
 ## Quality Checklist
 
@@ -79,6 +88,29 @@ Self-check after writing `signal_engine.py`:
 - [ ] Boundary handling: for empty data or insufficient history before the lookback window, use `fillna(0)` or skip
 - [ ] Portfolio strategy: once N stocks are selected, each weight = 1/N (for example top 10 → each 0.1), unselected names = 0
 - [ ] Signal values stay within `[-1.0, 1.0]`
+- [ ] The signal is not shifted: the engine fills a signal set on bar `t` at the open of bar `t+1`
+
+### Verify execution timing before reporting performance
+
+A successful backtest confirms execution, not fidelity to the requested rule.
+Independently calculate the first entry and exit conditions from the input bars,
+then compare their expected next-bar dates with `artifacts/fills.jsonl` (read the
+actual artifact path returned by the backtest). Check any additional cases where
+the strategy changes state. A condition true at Tuesday's close normally fills
+at Wednesday's open, not Thursday's. Explain legitimate differences from market
+closures, price limits, insufficient cash or other engine execution rules.
+If the strategy added a second delay to implement "next open", remove that
+extra delay, rerun, and report only the corrected run's metrics. Do not remove
+indicator lookbacks or an explicitly requested delay merely because they use
+`shift`. When comparing return figures with another implementation, align the
+input prices, execution prices, position sizing, fees and evaluation window as
+well as the fill dates; matching dates alone does not establish equal returns.
+
+The runner rejects detected shifts forwarded to returned targets with
+`signal_timing_double_delay`. Fix the strategy rather than changing configuration
+to bypass that error. Only when the user's rule explicitly intends extra delayed
+decisions, declare the extra bars in `intentional_signal_delay_bars`; the engine
+still adds its normal next-open delay, and the run card discloses the extra lag.
 
 ## Instrument Code Normalization
 
@@ -109,7 +141,7 @@ Self-check after writing `signal_engine.py`:
 
 **`extra_fields` selection logic**: only China A-shares (`tushare`) support daily valuation fields. If the strategy needs `PE/PB/ROE` and similar daily_basic fields, specify them in `config.json.extra_fields` and `DataLoader` will retrieve them automatically. Hong Kong, US, Canadian stocks, and crypto do not support `extra_fields`.
 
-**`fundamental_fields` selection logic**: use this for China A-share financial statement pre-filters. The runner queries `income`, `balancesheet`, `cashflow`, and/or `fina_indicator` through the Tushare fundamental provider, then merges rows into daily bars only after their announcement/disclosure date. Output columns are prefixed by table name, for example `income_total_revenue`, `income_n_income`, `balancesheet_total_hldr_eqy_exc_min_int`, and `fina_indicator_roe`.
+**`fundamental_fields` selection logic**: use this for China A-share financial statement pre-filters. The runner queries `income`, `balancesheet`, `cashflow`, and/or `fina_indicator` through the Tushare fundamental provider, then merges rows into daily bars only after their announcement/disclosure date. Output columns are prefixed by table name, for example `income_total_revenue`, `income_n_income`, `balancesheet_total_hldr_eqy_exc_min_int`, and `fina_indicator_roe`. **Daily frames only**: an announcement date carries no time of day, so on an intraday frame a filing would be visible from the first bar of its own announcement day. A sub-daily interval plus `fundamental_fields` is rejected outright; set `"fundamental_subdaily": "next_day"` to run it anyway under the conservative rule that day D's announcement becomes visible at the first bar of D+1.
 
 ## `config.json` Format
 
@@ -138,7 +170,7 @@ Self-check after writing `signal_engine.py`:
 - `source`: `"auto"` (recommended, auto-select by code format) / `"tushare"` / `"yfinance"` / `"okx"` / `"akshare"` / `"ccxt"`
   - `"auto"` supports mixed instruments. For example, `["000001.SZ", "BTC-USDT"]` will be automatically routed to `tushare` and `okx`
   - Futures codes (e.g. `"IF2406.CFFEX"`, `"ESZ4"`) and forex pairs (e.g. `"EUR/USD"`) are also auto-routed
-- `interval`: candlestick interval, default `"1D"`. Supported values: `"1m"` / `"5m"` / `"15m"` / `"30m"` / `"1H"` / `"4H"` / `"1D"`
+- `interval`: candlestick interval, default `"1D"`. Supported values: `"1m"` / `"5m"` / `"15m"` / `"30m"` / `"1H"` / `"4H"` / `"1D"` / `"1W"` / `"1M"` (weekly and monthly bars are built from daily ones; `"1M"` is a month, `"1m"` a minute)
   - The annualization factor for minute backtests is inferred automatically from `source` (252 trading days for China A-shares, 365 calendar days for crypto)
   - Minute backtests can be very data-heavy. Recommended limits are no more than 30 days for `1m`, or 1 year for `1H`
 - `warmup_bars`: how many leading bars exist only to prime the indicators. They are loaded and fed to `SignalEngine.generate()`, then excluded from trades, the equity curve, the benchmark and every metric. Default `0` grades the whole loaded window.
@@ -156,8 +188,12 @@ Self-check after writing `signal_engine.py`:
   - Rule of thumb: `"rebalance"` when the target weight itself carries the strategy (optimizers, risk budgets, continuous scaling); `"hold"` when entries and exits carry it and the weight in between is incidental.
 - `rebalance_mask`: optional execution schedule used only under `"rebalance"`. Use a pandas offset alias such as `"MS"`, `"W-FRI"`, or `"QS"`, or an explicit ISO-date list such as `["2026-01-02", "2026-02-02"]`. Each period/date selects the first aligned trading bar on or after it; ordinary bars HOLD even when the dense target is zero. An alias must not be finer than the aligned bar interval; `W-FRI` starts a Friday-anchored period and normally executes on the following Monday. Omit it to preserve every-bar execution. Do not combine it with `"hold"`.
 - `rebalance_tolerance`: drift band around the target, as a fraction of it, used only under `"rebalance"`. A resize executes once the held weight has moved further than this from its target; a **changed** target breaches any sane band on its own, so target changes always execute. Default `0.0` means no band, and then the resize test is decided by the slippage width alone — measured on a constant 20% target over 60 bars, `0.0` produced 60 fills, `0.02` produced 12, and `0.05` produced 5 while the weight never left 0.21. Use `rebalance_mask`, not tolerance, to express a strategy's execution cadence. `0.05` is a reasonable starting point, not a recommendation with evidence behind it — it is your modelling choice and the report records the value the run used.
+- `artifact_id`: optional. Set it only when the run benches an artifact registered with `sdm_register`; the backtest then records its metrics in that artifact's bench history. `bench_type` (`"initial"` / `"periodic"` / `"manual"`, default `"manual"`) states whether the run counts towards decay monitoring, which reads only `initial` and `periodic` runs. Omit both for exploratory runs.
 - `initial_cash`: default 1,000,000
 - `commission`: default 0.1%
+- Crypto: `commission` sets both fee sides unless `maker_rate` / `taker_rate` explicitly override that side. Bare spot pairs such as `BTC-USDT` do not pay funding by default. `-PERP`, `-SWAP`, CCXT settled contract codes and strict perpetual mode retain funding; a nonzero explicit `funding_rate` also opts a bare pair into a perpetual proxy assumption. `crypto_funding_pnl` in metrics reports the signed funding actually applied, separately from trade P&L.
+- `hk_lot_sizes`: optional, Hong Kong only — `{"00700.HK": 100, "02800.HK": 500}`. HK board lots are set per issuer, so without this table every HK order is rounded to 100 shares and a name whose real lot is smaller than its target trades zero times. Codes match with or without leading zeros. Every symbol with no configured lot size uses 100 shares and is listed under `lot_assumptions` in the metrics, including runs without a table. Reports must identify these as assumptions rather than verified exchange lots.
+- Argentina (BYMA `.BA` codes, e.g. `"YPFD.BA"`): use `"source": "yahoo"` and keep `"engine": "daily"`; `.BA` codes select the BYMA engine. Local shares can take their kind from Yahoo's descriptor (ARS, one-share lots as an assumption). Declare `ar_tick_table` as `"2024-07-04"`, `"2025-09-08-leader"` (leader panel / CEDEARs) or `"2025-09-08-general"`, or an instrument-specific `tick_table` / positive `tick_size`. These are explicit rule assumptions: choose the applicable table/panel for the window and split runs across rule changes; panel membership and effective dates are not inferred. `commission` is the brokerage rate; `ar_exchange_fee_rate`, `ar_fixed_fee` and `ar_slippage` add costs. Settlement is T+2 (T+1 from 2024-05-27) counted in observed trading sessions, an approximation rather than an official calendar. Settlement is not a ban on reselling acquired shares; CEDEAR credit dates still restrict exits, including terminal liquidation. `artifacts/cash_ledger.csv` reports each fill's cash flow and settlement session (`beyond_loaded_data` past the last bar). **CEDEARs** (e.g. `"AAPL.BA"`) must be declared: `"ar_instruments": {"AAPL.BA": {"kind": "cedear", "underlying": "AAPL", "ratio_history": [{"effective_date": "YYYY-MM-DD", "ratio": "20", "credit_date": "YYYY-MM-DD"}]}}`, with ratios from the issuer's notices. A `BYMA backtest configuration incomplete` error lists every missing key at once: ask the user for them rather than guessing. Report the `ar_data_basis` metric's labels (declared / vendor / assumption).
 - `validation`: optional statistical validation after backtest completes. Omit to skip. Example:
   ```json
   "validation": {
@@ -194,6 +230,7 @@ Self-check after writing `signal_engine.py`:
 2. **Late first trade** (first trade > 2 years after backtest start): data-filtering bug or overly long lookback window
 3. **Capital utilization < 50%**: position-management bug, portfolio is flat most of the time
 4. **Open position at the end** (positions still open when backtest ends): exit-signal timing bug
+5. **Double delay** (`signal_engine.py` shifts its own signal): every fill lands one bar later than the strategy describes, because the engine already fills a signal set on bar `t` at the open of bar `t+1`
 
 ### `action_items` Format
 

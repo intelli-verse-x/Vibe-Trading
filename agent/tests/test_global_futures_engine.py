@@ -65,6 +65,29 @@ class TestExtractProduct:
             ("NQ2503", "NQ"),
             ("ES.CME", "ES"),
             ("ZCH4", "ZC"),
+            ("OJF25", "OJ"),
+            ("ZRH25", "ZR"),
+            ("6EZ4", "6E"),
+            ("6JH25", "6J"),
+            ("6B", "6B"),
+            ("6A.CME", "6A"),
+            ("M2K", "M2K"),
+            ("MYM2503", "MYM"),
+            ("MYMZ4", "MYM"),
+            ("FESX2503", "FESX"),
+            ("FESXZ4", "FESX"),
+            ("FDAXH25", "FDAX"),
+            # The dated form of an embedded-digit product: the bare M2K
+            # check cannot see it, and no letters-only group spans "M2K".
+            ("M2KZ4", "M2K"),
+            ("M2K2503", "M2K"),
+            # A listed product that is a prefix of another listed product:
+            # longest match wins, so micro silver stays micro silver.
+            ("SILZ4", "SIL"),
+            ("SIZ4", "SI"),
+            # A product absent from the multiplier table still falls
+            # through to the shape regexes rather than being swallowed.
+            ("6NZ4", "6N"),
         ],
     )
     def test_extract(self, symbol: str, expected: str) -> None:
@@ -114,6 +137,15 @@ class TestPriceLimits:
         engine = _make_engine()
         bar = _make_bar(close=5200.0, pre_close=5000.0)  # +4%
         assert engine.can_execute("ESZ4", 1, bar) is True
+
+    @pytest.mark.parametrize("symbol", ["MYMZ4", "M2KZ4"])
+    def test_every_micro_equity_index_carries_the_limit(self, symbol: str) -> None:
+        """Micro Dow and micro Russell share the E-mini price limit, as MES/MNQ do."""
+        engine = _make_engine(codes=[symbol])
+        up = _make_bar(close=5400.0, pre_close=5000.0)  # +8% > 7%
+        down = _make_bar(close=4600.0, pre_close=5000.0)  # -8% > 7%
+        assert engine.can_execute(symbol, 1, up) is False
+        assert engine.can_execute(symbol, -1, down) is False
 
     def test_commodity_no_limit(self) -> None:
         """CL has no configured price limit; always allowed."""
@@ -180,6 +212,22 @@ class TestCommission:
         comm = engine.calc_commission(5, 5000.0, 1, is_open=True)
         assert comm == pytest.approx(5.0)
 
+    @pytest.mark.parametrize("symbol", ["MYMZ4", "M2KZ4"])
+    def test_every_micro_equity_index_pays_the_micro_rate(self, symbol: str) -> None:
+        """The micro equity-index contracts are priced like their siblings.
+
+        MES/MNQ already carried the micro rate; MYM/M2K used to fall through
+        to the full-size default and cost 4x what the same family pays.
+        """
+        engine = _make_engine()
+        comm = engine.calc_commission_for_symbol(symbol, 1, 5000.0, is_open=True)
+        assert comm == pytest.approx(0.62)
+
+    def test_unlisted_product_keeps_the_default(self) -> None:
+        engine = _make_engine()
+        comm = engine.calc_commission_for_symbol("XYZF25", 1, 5000.0, is_open=True)
+        assert comm == pytest.approx(2.50)
+
 
 # ---------------------------------------------------------------------------
 # Contract multiplier
@@ -196,8 +244,21 @@ class TestContractMultiplier:
             ("GCM25", 100),
             ("SIH25", 5000),
             ("ZCH4", 50),
+            ("OJF25", 150),
+            ("ZRH25", 2000),
+            ("KC=F", 375),
+            ("SBH25", 1120),
+            ("CTZ4", 500),
             ("ZBM5", 1000),
             ("MESZ4", 5),
+            ("6EZ4", 125000),
+            ("6JH25", 12500000),
+            ("6B", 62500),
+            ("M2K", 5),
+            ("MYM2503", 0.5),
+            ("FESXZ4", 10),
+            ("M2KZ4", 5),
+            ("SILZ4", 1000),
         ],
     )
     def test_multipliers(self, symbol: str, expected: float) -> None:

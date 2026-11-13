@@ -16,6 +16,7 @@ RUNNER_CAPABILITY = "runner.manage.requires_mandate"
 #: ``get_account_snapshot``, ``get_positions``, ``get_open_orders``, ``get_quote``,
 #: ``get_historical_bars``).
 _SDK_CONNECTOR_MODULES = {
+    "mstock": "src.trading.connectors.mstock.sdk",
     "tiger": "src.trading.connectors.tiger.sdk",
     "longbridge": "src.trading.connectors.longbridge.sdk",
     "alpaca": "src.trading.connectors.alpaca.sdk",
@@ -24,6 +25,10 @@ _SDK_CONNECTOR_MODULES = {
     "futu": "src.trading.connectors.futu.sdk",
     "dhan": "src.trading.connectors.dhan.sdk",
     "shoonya": "src.trading.connectors.shoonya.sdk",
+    "zerodha": "src.trading.connectors.zerodha.sdk",
+    "kis": "src.trading.connectors.kis.sdk",
+    "upbit": "src.trading.connectors.upbit.sdk",
+    "toss": "src.trading.connectors.toss.sdk",
     "trading212": "src.trading.connectors.trading212.sdk",
     "mt5": "src.trading.connectors.mt5.sdk",
     "etoro": "src.trading.connectors.etoro.sdk",
@@ -102,6 +107,9 @@ def _sdk_config(
     if connection.profile_id != profile.id:
         raise ValueError("local connection profile does not match the requested SDK profile")
 
+    if profile.connector == "futu" and connection.endpoint is not None:
+        options = {**connection.endpoint, **{key: value for key, value in options.items() if value not in (None, "")}}
+
     fields = credential_fields(profile.id)
     direct_secret_fields = set(fields).intersection(options)
     if direct_secret_fields:
@@ -127,9 +135,9 @@ def _sdk_config(
     #
     # Per-call overrides must still pass the connector's own allowlist. Every
     # SDK connector deliberately narrows what a caller may override — OKX and
-    # Binance both exclude ``readonly`` ("always true for this layer") and
-    # ``timeout``; Longbridge's overlay is ``profile``/``region`` only,
-    # precisely so a caller "cannot mix or bypass the shared resolver".
+    # Binance both exclude ``readonly`` and ``timeout``; Longbridge's overlay
+    # is ``profile``/``region`` only, precisely so a caller "cannot mix or
+    # bypass the shared resolver".
     # ``build_config`` applies that filter; constructing from a raw merged
     # mapping would not, and ``overrides`` is the one part of this payload that
     # reaches us from an MCP tool argument or a REST body.
@@ -153,10 +161,17 @@ def _local_plugin_call(
     from src.trading.connections import ConnectionStore, credential_fields
     from src.trading.local_plugins import load_adapter, plugin_by_profile_id
 
+    store = ConnectionStore()
     connection_id = str(overrides.get("connection_id") or "").strip().lower()
     if not connection_id:
+        # CLI/agent flows do not carry a connection id; when the operator has
+        # installed exactly one connection for this profile, use it. Explicit
+        # ids (Web UI) always win.
+        candidates = [row for row in store.list() if row.profile_id == profile.id]
+        if len(candidates) == 1:
+            connection_id = candidates[0].id
+    if not connection_id:
         raise ValueError("local connector plugins require a connection_id")
-    store = ConnectionStore()
     connection = store.get(connection_id)
     if connection.profile_id != profile.id:
         raise ValueError("local connection profile does not match the requested plugin")
@@ -227,6 +242,31 @@ def get_account(profile_id: str | None = None, **overrides: Any) -> dict[str, An
     )
 
 
+def get_accounts(profile_id: str | None = None, **overrides: Any) -> dict[str, Any]:
+    """List the broker accounts a remote MCP profile can be scoped to.
+
+    Only remote MCP connectors whose account-scoped reads take an account
+    (Robinhood) map this operation; every other profile reports it unsupported.
+
+    Args:
+        profile_id: Connector profile to read through.
+        **overrides: ``interactive_oauth=False`` keeps an expired grant from
+            opening a browser.
+
+    Returns:
+        The remote envelope; a mapped connector adds an ``accounts`` list.
+    """
+    profile = profile_by_id(profile_id)
+    if profile.transport != "remote_mcp":
+        return _unsupported(profile, "accounts.read")
+    return _call_remote(
+        profile,
+        "accounts",
+        {},
+        interactive_oauth=bool(overrides.get("interactive_oauth", True)),
+    )
+
+
 def get_positions(profile_id: str | None = None, **overrides: Any) -> dict[str, Any]:
     """Read positions for a connector profile."""
     profile = profile_by_id(profile_id)
@@ -293,7 +333,17 @@ def get_quote(
     sec_type: str = "STK",
     **overrides: Any,
 ) -> dict[str, Any]:
-    """Read a quote for a connector profile."""
+    """Read a quote for a connector profile.
+
+    Args:
+        symbol: Instrument symbol to quote.
+        profile_id: Connector profile to read through.
+        exchange: IBKR exchange, ignored off the local TWS transport.
+        currency: Quote currency, ignored off the local TWS transport.
+        sec_type: IBKR security type, ignored off the local TWS transport.
+        **overrides: ``interactive_oauth=False`` keeps an expired grant from
+            opening a browser, matching the other remote MCP reads.
+    """
     profile = profile_by_id(profile_id)
     if profile.transport == "local_tws":
         from src.trading.connectors.ibkr.local import get_quote as _get_quote
@@ -316,7 +366,12 @@ def get_quote(
             profile,
             _local_plugin_call(profile, "get_quote", overrides, symbol),
         )
-    return _call_remote(profile, "quote", {"symbols": [symbol], "symbol": symbol})
+    return _call_remote(
+        profile,
+        "quote",
+        {"symbols": [symbol], "symbol": symbol},
+        interactive_oauth=bool(overrides.get("interactive_oauth", True)),
+    )
 
 
 def search_instruments(
@@ -338,6 +393,18 @@ def search_instruments(
             module.search_instruments(
                 query,
                 config=module.build_config(profile.config, overrides),
+                limit=limit,
+            ),
+        )
+    if profile.connector == "mt5" and profile.transport == "broker_sdk":
+        if "terminal_path" in overrides:
+            return {"status": "error", "error": "MT5 search uses the configured terminal path", "instruments": []}
+        module = _sdk_module(profile.connector)
+        return _with_profile(
+            profile,
+            module.search_instruments(
+                query,
+                config=_sdk_config(profile, module, overrides),
                 limit=limit,
             ),
         )
@@ -1268,6 +1335,110 @@ def runner_tool_name(connector: str, operation: str) -> str | None:
     return None
 
 
+def runner_requires_account(connector: str) -> bool:
+    """Return whether a live runner broker's reads and orders must name an account.
+
+    Args:
+        connector: Broker key, e.g. ``"robinhood"``.
+
+    Returns:
+        True when the broker's live-runner profile declares
+        ``account_selection: required``. Such a broker never falls back to a
+        default account: a mandate without one cannot trade.
+    """
+    from src.trading.connections import requires_account_selection
+
+    profile = live_runner_profile_for_broker(connector)
+    return profile is not None and requires_account_selection(profile)
+
+
+def runner_arguments(connector: str, operation: str, account_ref: str = "", **arguments: Any) -> dict[str, Any]:
+    """Return the wire arguments for a live-path read, bound to one account.
+
+    Args:
+        connector: Broker key.
+        operation: Generic operation (``account``, ``positions``, ``orders``).
+        account_ref: The mandate's account; empty for a broker that takes none.
+        **arguments: Further generic arguments.
+
+    Returns:
+        The connector's wire arguments. A connector without a mapping gets
+        ``arguments`` unchanged, which is what the live path sent before.
+    """
+    if connector == "robinhood":
+        from src.trading.connectors.robinhood.mcp import remote_arguments
+
+        return remote_arguments(operation, {**arguments, "account": account_ref})
+    return dict(arguments)
+
+
+def runner_records(connector: str, operation: str, envelope: Any) -> list[dict[str, Any]] | None:
+    """Unwrap a live-path list read into complete broker records.
+
+    Args:
+        connector: Broker key.
+        operation: ``positions`` or ``orders``.
+        envelope: The adapter's call result.
+
+    Returns:
+        The records, or ``None`` when the connector has no mapped reply shape
+        (the caller keeps its generic unwrap).
+
+    Raises:
+        ValueError: If a mapped reply does not match its shape, is one page of
+            several, or is an error envelope.
+    """
+    if connector != "robinhood":
+        return None
+    from src.trading.connectors.robinhood import mcp
+
+    if operation == "positions":
+        return [{**row, "qty": row["quantity"]} for row in mcp.position_rows(envelope)]
+    if operation == "orders":
+        return mcp.records(envelope, "orders", "get_equity_orders")
+    raise ValueError(f"no record mapping for operation {operation!r}")
+
+
+def runner_account_summary(connector: str, envelope: Any) -> dict[str, Any] | None:
+    """Unwrap a live-path account read into the mapped summary.
+
+    Args:
+        connector: Broker key.
+        envelope: The adapter's call result.
+
+    Returns:
+        The summary, or ``None`` when the connector has no mapped reply shape.
+
+    Raises:
+        ValueError: If a mapped reply does not match its shape.
+    """
+    if connector != "robinhood":
+        return None
+    from src.trading.connectors.robinhood.mcp import portfolio_summary
+
+    return portfolio_summary(envelope)
+
+
+def runner_account_choices(connector: str, envelope: Any) -> list[dict[str, Any]] | None:
+    """Map a live-path account listing to picker rows.
+
+    Args:
+        connector: Broker key.
+        envelope: The adapter's ``accounts`` call result.
+
+    Returns:
+        The picker rows, or ``None`` when the connector lists no accounts.
+
+    Raises:
+        ValueError: If a mapped reply does not match its shape.
+    """
+    if connector != "robinhood":
+        return None
+    from src.trading.connectors.robinhood.mcp import account_choices
+
+    return account_choices(envelope)
+
+
 def _with_profile(profile: TradingProfile, payload: dict[str, Any]) -> dict[str, Any]:
     """Add connector profile metadata to an operation payload."""
     result = dict(payload)
@@ -1288,6 +1459,15 @@ def _ibkr_config(profile: TradingProfile, overrides: dict[str, Any]):
         cfg = base
     else:
         cfg = default_cfg
+    connection_id = _clean(overrides.get("connection_id"))
+    if connection_id is not None:
+        from src.trading.connections import ConnectionStore
+
+        connection = ConnectionStore().get(connection_id)
+        if connection.profile_id != profile.id:
+            raise ValueError("local connection profile does not match the requested IBKR profile")
+        if connection.endpoint is not None:
+            cfg = cfg.with_overrides(**connection.endpoint)
     return cfg.with_overrides(
         host=_clean(overrides.get("host")),
         port=_int_or_none(overrides.get("port")),
@@ -1420,12 +1600,69 @@ def _call_remote(
         else MCPServerAdapter(server_name, server, interactive_oauth=False)
     )
     call_result = adapter.call_tool(remote_name, _remote_arguments(profile.connector, operation, arguments))
-    call_result = _normalize_remote_result(profile.connector, operation, call_result)
+    call_result = _complete_paginated_reply(
+        profile.connector, operation, call_result, adapter, remote_name, arguments
+    )
+    if profile.connector == "robinhood" and operation == "quote":
+        from src.trading.connectors.robinhood.mcp import normalize_result
+
+        call_result = normalize_result(operation, call_result, expected_symbol=arguments.get("symbol"))
+    else:
+        call_result = _normalize_remote_result(profile.connector, operation, call_result)
     account_number = arguments.get("account_number")
     if account_number:
         call_result = dict(call_result)
         call_result.setdefault("account_number", account_number)
     return _with_profile(profile, call_result)
+
+
+def _complete_paginated_reply(
+    connector: str,
+    operation: str,
+    envelope: dict[str, Any],
+    adapter: Any,
+    remote_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Follow a connector's advertised pagination cursor to the last page.
+
+    Robinhood's list reads answer one page at a time: the reply's ``next`` is
+    an opaque cursor the schema directs callers to pass back verbatim as the
+    tool's ``cursor`` argument, other arguments unchanged, until it comes back
+    empty. The portfolio needs the whole account, so the generic read follows
+    the cursor here, before any mapping runs, and hands the mappers one
+    complete reply. A connector or operation without a mapped cursor keeps the
+    single-page reply, and its mapping refuses a non-empty ``next`` as before.
+
+    Args:
+        connector: Broker key the profile selects.
+        operation: Generic read operation that produced the reply.
+        envelope: The first page's ``MCPServerAdapter.call_tool`` result.
+        adapter: The MCP adapter the first call went through.
+        remote_name: Remote tool name the first call used.
+        arguments: Wire arguments of the first call, re-sent unchanged (plus
+            the cursor) on every follow-up page.
+
+    Returns:
+        The first envelope unchanged when there is nothing to follow, else
+        the connector's merged whole-account reply.
+
+    Raises:
+        ValueError: If a follow-up page fails or breaks shape, per the
+            connector's pagination helper. A partial multi-page read is never
+            returned.
+    """
+    if connector != "robinhood" or operation not in ("positions", "orders"):
+        return envelope
+    from src.trading.connectors.robinhood import mcp
+
+    def refetch(cursor: str) -> dict[str, Any]:
+        return adapter.call_tool(
+            remote_name, _remote_arguments(connector, operation, {**arguments, "cursor": cursor})
+        )
+
+    list_key = "positions" if operation == "positions" else "orders"
+    return mcp.with_all_pages(envelope, list_key, remote_name, refetch)
 
 
 def _remote_tool_name(connector: str, operation: str) -> str | None:
@@ -1436,6 +1673,10 @@ def _remote_tool_name(connector: str, operation: str) -> str | None:
         return remote_tool_name(operation)
     if connector == "robinhood":
         from src.trading.connectors.robinhood.mcp import remote_tool_name
+
+        return remote_tool_name(operation)
+    if connector == "scalable":
+        from src.trading.connectors.scalable.mcp import remote_tool_name
 
         return remote_tool_name(operation)
     return None
@@ -1451,6 +1692,10 @@ def _remote_arguments(connector: str, operation: str, arguments: dict[str, Any])
         from src.trading.connectors.robinhood.mcp import remote_arguments
 
         return remote_arguments(operation, arguments)
+    if connector == "scalable":
+        from src.trading.connectors.scalable.mcp import remote_arguments
+
+        return remote_arguments(operation, arguments)
     return {}
 
 
@@ -1458,6 +1703,10 @@ def _normalize_remote_result(connector: str, operation: str, result: dict[str, A
     """Map connector-specific MCP envelopes into shared read payloads."""
     if connector == "ibkr":
         from src.trading.connectors.ibkr.mcp import normalize_result
+
+        return normalize_result(operation, result)
+    if connector == "robinhood":
+        from src.trading.connectors.robinhood.mcp import normalize_result
 
         return normalize_result(operation, result)
     return result

@@ -29,7 +29,18 @@ from src.providers.openai_codex import (
 )
 
 
-DEFAULT_CODEX_MODEL = "openai-codex/gpt-5.4"
+DEFAULT_CODEX_MODEL = "openai-codex/gpt-6-sol"
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "ultra", "persistent"])
+def test_explicit_catalog_effort_reaches_the_wire(effort):
+    adapter = OpenAICodexLLM(model=DEFAULT_CODEX_MODEL, reasoning_effort=effort)
+    assert adapter._body([], stream=True)["reasoning"] == {"effort": effort}
+
+
+def test_unset_catalog_effort_preserves_provider_default():
+    adapter = OpenAICodexLLM(model=DEFAULT_CODEX_MODEL)
+    assert "reasoning" not in adapter._body([], stream=True)
 
 
 def _jwt(payload: dict[str, object]) -> str:
@@ -92,8 +103,8 @@ def test_codex_body_strips_provider_prefix_and_converts_tools() -> None:
         stream=True,
     )
 
-    assert _strip_model_prefix(DEFAULT_CODEX_MODEL) == "gpt-5.4"
-    assert body["model"] == "gpt-5.4"
+    assert _strip_model_prefix(DEFAULT_CODEX_MODEL) == "gpt-6-sol"
+    assert body["model"] == "gpt-6-sol"
     assert body["instructions"] == "You are careful."
     assert body["tools"][0]["name"] == "bash"
     assert body["input"][0]["content"][0]["text"] == "Say hi."
