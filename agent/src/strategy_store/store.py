@@ -12,7 +12,6 @@ backends.
 
 from __future__ import annotations
 
-import copy
 import threading
 import uuid
 from dataclasses import replace
@@ -27,7 +26,6 @@ from src.strategy_store.models import (
     ArtifactType,
     BenchResult,
     DecaySnapshot,
-    DecaySignal,
     ValidationStatus,
     validate_validation_status_transition,
 )
@@ -116,10 +114,42 @@ class StrategyStoreProtocol(Protocol):
         """Record a bench result. Returns the result ID."""
         ...
 
+    def record_bench_once(self, result: BenchResult) -> int | None:
+        """Atomically record new evidence; ignore location and grading metadata."""
+        ...
+
     def get_bench_history(
-        self, artifact_id: str, *, limit: int = 50
+        self,
+        artifact_id: str,
+        *,
+        limit: int = 50,
+        bench_types: Sequence[str] | None = None,
     ) -> Sequence[BenchResult]:
-        """Get bench history for an artifact, newest first."""
+        """Get bench history for an artifact, newest first.
+
+        Args:
+            artifact_id: Artifact whose bench rows are returned.
+            limit: Maximum number of rows.
+            bench_types: When given, only rows of these bench types are
+                returned, and ``limit`` applies after the filter.
+
+        Returns:
+            Matching bench results, newest first.
+        """
+        ...
+
+    def has_bench_result(self, result: BenchResult) -> bool:
+        """Return whether an identical bench row is already stored.
+
+        Identity uses the artifact, evaluation windows and measured metrics.
+        IDs, timestamps, directories, bench labels and grading are metadata.
+
+        Args:
+            result: Candidate bench result.
+
+        Returns:
+            ``True`` when a stored row matches ``result``.
+        """
         ...
 
     # --- Decay snapshots ---
@@ -202,19 +232,23 @@ class InMemoryStrategyStore:
         limit: int = 100,
     ) -> Sequence[Artifact]:
         """List artifacts with composable filters, newest first."""
-        results: list[Artifact] = []
-        for art in self._artifacts.values():
+        results: list[tuple[int, Artifact]] = []
+        for position, art in enumerate(self._artifacts.values()):
             if type is not None and art.type != type:
                 continue
             if status is not None and art.status != status:
                 continue
             if universe is not None and art.universe != universe:
                 continue
-            results.append(art)
+            results.append((position, art))
 
-        # Sort by created_at descending (newest first).
-        results.sort(key=lambda a: a.created_at or "", reverse=True)
-        return results[:limit]
+        # Sort by created_at descending (newest first), breaking ties on
+        # insertion order. Sorting is stable and reverse=True does not reorder
+        # equal keys, so without the tiebreaker records sharing a timestamp
+        # come back oldest first. Timestamps collide readily: _now_iso() has
+        # only the clock's resolution behind it.
+        results.sort(key=lambda pair: (pair[1].created_at or "", pair[0]), reverse=True)
+        return [art for _, art in results[:limit]]
 
     @_synchronized
     def update_status(
@@ -294,13 +328,57 @@ class InMemoryStrategyStore:
         return stored.id
 
     @_synchronized
+    def record_bench_once(self, result: BenchResult) -> int | None:
+        """Record new evidence once under the same lock as the duplicate check."""
+        if self.has_bench_result(result):
+            return None
+        return self.record_bench(result)
+
+    @_synchronized
     def get_bench_history(
-        self, artifact_id: str, *, limit: int = 50
+        self,
+        artifact_id: str,
+        *,
+        limit: int = 50,
+        bench_types: Sequence[str] | None = None,
     ) -> Sequence[BenchResult]:
-        """Return bench results for an artifact, newest first."""
-        matched = [r for r in self._bench_results if r.artifact_id == artifact_id]
-        matched.sort(key=lambda r: r.created_at or "", reverse=True)
+        """Return bench results for an artifact, newest first.
+
+        Args:
+            artifact_id: Artifact whose bench rows are returned.
+            limit: Maximum number of rows.
+            bench_types: When given, only rows of these bench types are
+                returned, and ``limit`` applies after the filter.
+
+        Returns:
+            Matching bench results, newest first.
+        """
+        matched = [
+            r
+            for r in self._bench_results
+            if r.artifact_id == artifact_id
+            and (bench_types is None or r.bench_type in bench_types)
+        ]
+        # id ascends with insertion, so it breaks timestamp ties newest first.
+        matched.sort(key=lambda r: (r.created_at or "", r.id or 0), reverse=True)
         return matched[:limit]
+
+    @_synchronized
+    def has_bench_result(self, result: BenchResult) -> bool:
+        """Return whether an identical bench row is already stored.
+
+        Args:
+            result: Candidate measurement; location, time and grading metadata
+                are ignored.
+
+        Returns:
+            ``True`` when a stored measurement has the same artifact, windows and metrics.
+        """
+        probe = replace(result, id=None, created_at="", run_dir=None, bench_type="", category=None)
+        return any(
+            replace(stored, id=None, created_at="", run_dir=None, bench_type="", category=None) == probe
+            for stored in self._bench_results
+        )
 
     # -- Decay snapshots -----------------------------------------------------
 
@@ -327,5 +405,6 @@ class InMemoryStrategyStore:
     ) -> Sequence[DecaySnapshot]:
         """Return decay snapshots for an artifact, newest first."""
         matched = [s for s in self._decay_snapshots if s.artifact_id == artifact_id]
-        matched.sort(key=lambda s: s.created_at or "", reverse=True)
+        # id ascends with insertion, so it breaks timestamp ties newest first.
+        matched.sort(key=lambda s: (s.created_at or "", s.id or 0), reverse=True)
         return matched[:limit]

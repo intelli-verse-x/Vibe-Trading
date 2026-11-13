@@ -19,6 +19,7 @@ import ccxt
 
 import backtest.loaders.ccxt_loader as cl
 from backtest.loaders.base import DEFAULT_MAX_RETRIES
+from tests.loader_contract import assert_loader_contract
 from backtest.loaders.ccxt_loader import DataLoader
 
 SINCE = int(pd.Timestamp("2026-05-01").timestamp() * 1000)
@@ -79,7 +80,7 @@ def test_happy_path_single_call_unchanged():
     df = DataLoader._fetch_one(ex, "BTC/USDT", "1d", SINCE, END)
     assert ex.calls == 1  # short page (< limit) -> exactly one call, as before
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
-
+    assert_loader_contract(df, context="ccxt bounded daily")
 
 def test_wallclock_budget_enforced(monkeypatch):
     seq = iter([1000.0, 1000.0, 1_000_000.0])  # deadline blown by the retry check
@@ -142,3 +143,33 @@ def test_valid_timeout_env_values_are_honored_on_reload(monkeypatch):
         monkeypatch.delenv("CCXT_TIMEOUT_MS", raising=False)
         monkeypatch.delenv("CCXT_FETCH_BUDGET_S", raising=False)
         importlib.reload(cl)
+
+
+
+def test_exchange_page_cap_below_1000_keeps_paginating():
+    hour_ms = 3_600_000
+    since = int(pd.Timestamp("2024-01-01").timestamp() * 1000)
+    end = int(pd.Timestamp("2024-03-01").timestamp() * 1000)
+
+    class ThreeHundredPerPage:
+        """OKX-style exchange: at most 300 candles per call, as ccxt declares."""
+
+        features = {"spot": {"fetchOHLCV": {"limit": 300}}}
+        calls = 0
+
+        def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
+            del symbol, timeframe
+            self.calls += 1
+            first = -(-since // hour_ms) * hour_ms
+            stop = min(first + min(limit, 300) * hour_ms, end)
+            return [
+                [ts, 100.0, 101.0, 99.0, 100.0, 10.0]
+                for ts in range(first, stop, hour_ms)
+            ]
+
+    ex = ThreeHundredPerPage()
+    df = DataLoader._fetch_one(ex, "BTC/USDT", "1h", since, end)
+    assert len(df) == 60 * 24
+    assert df.index[0] == pd.Timestamp("2024-01-01 00:00")
+    assert df.index[-1] == pd.Timestamp("2024-02-29 23:00")
+    assert ex.calls == 5

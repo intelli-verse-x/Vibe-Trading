@@ -51,6 +51,7 @@ _ATTRIBUTION_BARS_PER_YEAR_BY_INTERVAL = {
     "1d": 252,
     "d": 252,
     "daily": 252,
+    "1w": 52,
     "1wk": 52,
     "w": 52,
     "weekly": 52,
@@ -95,9 +96,11 @@ def _attribution_bars_per_year(interval: Any) -> int:
     """Infer the annualization factor from the run's bar interval label."""
     if not interval:
         return _ATTRIBUTION_DEFAULT_BARS_PER_YEAR
-    return _ATTRIBUTION_BARS_PER_YEAR_BY_INTERVAL.get(
-        str(interval).strip().lower(), _ATTRIBUTION_DEFAULT_BARS_PER_YEAR
-    )
+    label = str(interval).strip()
+    # The runner's monthly token; lower-cased it would read as one minute.
+    if label == "1M":
+        return 12
+    return _ATTRIBUTION_BARS_PER_YEAR_BY_INTERVAL.get(label.lower(), _ATTRIBUTION_DEFAULT_BARS_PER_YEAR)
 
 
 def _attribution_downsample(
@@ -190,11 +193,13 @@ def _attribution_load_equity(
     has_benchmark_column = "benchmark_equity" in fieldnames
     benchmark_all_blank = True
     for row in rows:
-        ret = _attribution_finite_float(row.get("ret"))
-        if ret is None:
-            continue
+        # Keep one entry per equity row. Dropping only an invalid portfolio
+        # return would make adjacent benchmark equity values span a longer
+        # interval, then pair that multi-bar benchmark return with one bar of
+        # portfolio return below.
         dates.append(str(row.get("timestamp") or ""))
-        portfolio_returns.append(ret)
+        ret = _attribution_finite_float(row.get("ret"))
+        portfolio_returns.append(ret if ret is not None else float("nan"))
         if has_benchmark_column:
             benchmark_value = _attribution_finite_float(row.get("benchmark_equity"))
             if benchmark_value is not None:
@@ -203,7 +208,7 @@ def _attribution_load_equity(
             else:
                 benchmark_equity.append(float("nan"))
 
-    if not portfolio_returns:
+    if not any(math.isfinite(value) for value in portfolio_returns):
         return None, None, None, "missing"
 
     if not has_benchmark_column or benchmark_all_blank:
@@ -357,7 +362,7 @@ def _attribution_factor_section(
     dates: List[str],
     portfolio_returns: List[float],
     benchmark_returns: Optional[List[float]],
-    bars_per_year: int,
+    bars_per_year: float,
     notes: List[str],
 ) -> Optional[Dict[str, Any]]:
     """Build the factor section: full-sample OLS plus rolling and cumulative series.
@@ -511,10 +516,22 @@ def _attribution_run_brinson(
 
 
 def _attribution_load_position_weights(run_dir: Path, notes: List[str]) -> Optional[Dict[str, float]]:
-    """Read the last row of ``positions.csv`` as per-symbol weights.
+    """Read the book Brinson should attribute from ``positions.csv``.
 
-    Returns ``None`` (with a skip note) when the artifact is missing or cannot
-    be parsed into at least one weighted symbol column.
+    A run closes every position on its last bar (``end_of_backtest``), so the
+    final row is all zeros by construction and describes the liquidation, not
+    the portfolio. When that row is flat, the row before it is read instead,
+    and the note names its timestamp. Only one row is stepped back: a book that
+    was already flat before the close is reported as flat rather than replaced
+    by some older holding.
+
+    Args:
+        run_dir: Backtest run directory containing ``artifacts/positions.csv``.
+        notes: Report notes; skip and fallback reasons are appended here.
+
+    Returns:
+        Per-symbol weights, or ``None`` (with a skip note) when the artifact is
+        missing or has no weighted symbol column.
     """
     path = run_dir / "artifacts" / "positions.csv"
     try:
@@ -532,12 +549,27 @@ def _attribution_load_position_weights(run_dir: Path, notes: List[str]) -> Optio
     if not symbols:
         notes.append("brinson attribution skipped: positions.csv could not be parsed")
         return None
-    last_row = rows[-1]
-    weights: Dict[str, float] = {}
-    for symbol in symbols:
-        weight = _attribution_finite_float(last_row.get(symbol))
-        weights[symbol] = weight if weight is not None else 0.0
-    return weights
+
+    def _row_weights(row: Dict[str, Any]) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for symbol in symbols:
+            weight = _attribution_finite_float(row.get(symbol))
+            out[symbol] = weight if weight is not None else 0.0
+        return out
+
+    weights = _row_weights(rows[-1])
+    if any(weights.values()) or len(rows) < 2:
+        return weights
+    held = _row_weights(rows[-2])
+    if not any(held.values()):
+        # Flat before the close as well: the downstream zero-check reports it.
+        return weights
+    timestamp = str(rows[-2].get(fieldnames[0]) or "").strip()
+    notes.append(
+        "brinson attribution used the positions row before the end-of-backtest "
+        f"liquidation ({timestamp or 'second-to-last row'})"
+    )
+    return held
 
 
 def _attribution_brinson_section(
@@ -653,13 +685,18 @@ def _attribution_brinson_asset_class_mode(
 
     class_weights: Dict[str, float] = {}
     class_return_sums: Dict[str, float] = {}
+    # A class with any unpriced member has no measurable return: summing only
+    # the priced members over the full class weight reads the rest as 0%.
+    unresolved_classes: set[str] = set()
     for symbol, weight in weights.items():
         if weight == 0.0:
             continue
         asset_class = str(_detect_market(symbol))
         class_weights[asset_class] = class_weights.get(asset_class, 0.0) + weight
         symbol_return = _attribution_symbol_cumulative_return(run_dir, symbol)
-        if symbol_return is not None:
+        if symbol_return is None:
+            unresolved_classes.add(asset_class)
+        else:
             class_return_sums[asset_class] = class_return_sums.get(asset_class, 0.0) + weight * symbol_return
 
     portfolio_weights: Dict[str, float] = {}
@@ -668,7 +705,11 @@ def _attribution_brinson_asset_class_mode(
     for asset_class, class_weight in class_weights.items():
         # A class whose long/short weights net to zero (market-neutral pair
         # inside one class) would divide by zero below; degrade instead.
-        if asset_class not in class_return_sums or abs(class_weight) <= _ATTRIBUTION_CLASS_WEIGHT_FLOOR:
+        if (
+            asset_class in unresolved_classes
+            or asset_class not in class_return_sums
+            or abs(class_weight) <= _ATTRIBUTION_CLASS_WEIGHT_FLOOR
+        ):
             degraded = True
             break
         portfolio_weights[asset_class] = class_weight
@@ -757,6 +798,17 @@ def _build_attribution_payload(run_dir: Path) -> Dict[str, Any]:
     if isinstance(raw_codes, list):
         codes = [str(code) for code in raw_codes if str(code).strip()]
     bars_per_year = _attribution_bars_per_year(config.get("interval"))
+    # The run card records the actual source/served-spacing convention, which
+    # can differ from the requested interval (e.g. crypto trades 365 days/year).
+    card = _attribution_load_json(run_dir / "run_card.json") or {}
+    annualisation = card.get("annualisation")
+    if isinstance(annualisation, dict):
+        raw_rate = annualisation.get("bars_per_year")
+        recorded_rate = (
+            None if isinstance(raw_rate, bool) else _attribution_finite_float(raw_rate)
+        )
+        if recorded_rate is not None and recorded_rate > 0:
+            bars_per_year = recorded_rate
 
     # Mirror the factor scan's symlink rejection: a symlinked artifacts dir is
     # treated as having no readable artifacts rather than followed.
@@ -780,17 +832,18 @@ def _build_attribution_payload(run_dir: Path) -> Dict[str, Any]:
     config_benchmark = config.get("benchmark")
     if isinstance(config_benchmark, dict):
         config_benchmark = config_benchmark.get("ticker") or config_benchmark.get("code")
-    if config_benchmark is not None and str(config_benchmark).strip():
-        benchmark_ticker = str(config_benchmark).strip()
-    if benchmark_ticker is None:
-        _metrics_fields, metrics_rows = _attribution_read_csv(run_dir / "artifacts" / "metrics.csv")
-        if metrics_rows:
-            candidate = metrics_rows[0].get("benchmark_ticker")
-            if candidate is not None and str(candidate).strip():
-                benchmark_ticker = str(candidate).strip()
+    _, metrics_rows = _attribution_read_csv(run_dir / "artifacts" / "metrics.csv")
+    recorded = metrics_rows[0] if metrics_rows else {}
+    # New runs record the reference actually used, including a fallback after
+    # an explicit fetch failed. Older runs only had a ticker or the request.
+    if recorded.get("benchmark_kind") != "equal_weight":
+        candidate = recorded.get("benchmark_ticker") or config_benchmark
+        if candidate and str(candidate).strip() not in {"", "auto"}:
+            benchmark_ticker = str(candidate).strip()
 
     if benchmark_ticker is not None:
-        payload["benchmark"] = {"ticker": benchmark_ticker, "mode": "explicit"}
+        mode = "auto_market" if config_benchmark == "auto" else "explicit"
+        payload["benchmark"] = {"ticker": benchmark_ticker, "mode": mode}
     else:
         payload["benchmark"] = {"ticker": None, "mode": "auto_equal_weight"}
 

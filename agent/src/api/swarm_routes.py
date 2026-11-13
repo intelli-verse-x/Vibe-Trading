@@ -143,6 +143,7 @@ def register_swarm_routes(
 
         run = runtime._store.reconcile_run(loaded, write=True)
 
+        from src.swarm.models import public_model_metadata, public_provider_metadata
         from src.swarm.serialization import serialize_task
 
         return {
@@ -164,6 +165,17 @@ def register_swarm_routes(
             "created_at": run.created_at,
             "completed_at": run.completed_at,
             "final_report": run.final_report,
+            # Key names AND value policy mirror the MCP run payload
+            # (mcp_server._run_to_dict): provider/model pass through the same
+            # public-metadata gate on read, so a run.json written before that
+            # gate existed cannot leak an endpoint- or credential-shaped string
+            # to a browser client. Totals come from the reconciled run, so a
+            # never-run run reports int 0 totals and token_source None.
+            "total_input_tokens": run.total_input_tokens,
+            "total_output_tokens": run.total_output_tokens,
+            "provider": public_provider_metadata(run.provider),
+            "model": public_model_metadata(run.model),
+            "token_source": run.token_source,
         }
 
     @app.get(
@@ -216,6 +228,12 @@ def register_swarm_routes(
         _host_validate_path_param(run_id, "run_id")
         runtime = _get_swarm_runtime()
         ok = runtime.cancel_run(run_id)
+        if not ok:
+            # Runs started by the agent are owned by a runtime created inside the
+            # tool call; the module index is the only handle that reaches them.
+            from src.swarm.runtime import cancel_indexed_run
+
+            ok = cancel_indexed_run(run_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"No active run {run_id}")
         return {"status": "cancelled"}

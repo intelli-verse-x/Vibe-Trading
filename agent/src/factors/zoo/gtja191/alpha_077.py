@@ -7,7 +7,7 @@
 """GTJA Alpha #77.
 
 Formula: MIN(RANK(DECAYLINEAR(((HIGH+LOW)/2+HIGH-(VWAP+HIGH)),20)),RANK(DECAYLINEAR(CORR(((HIGH+LOW)/2),MEAN(VOLUME,40),3),6)))
-Source: 国泰君安 191 alpha 研报 (2014), alpha 77."""
+Source: 国泰君安 191 alpha 研报 (2017-06-15), alpha 77."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from src.factors.base import (
     ts_min,
     ts_rank,
     ts_std,
+    vwap,
 )
 
 __alpha_meta__ = {
@@ -41,17 +42,17 @@ __alpha_meta__ = {
     "universe": ["equity_cn"],
     "frequency": ["1d"],
     "decay_horizon": 20,
-    "min_warmup_bars": 37,
-    "notes": '40d MA truncated to 30d.',
+    "min_warmup_bars": 47,
+    "notes": "Original report windows; full nested-window coverage is required.",
 }
 
 def compute(panel: dict) -> pd.DataFrame:
     h = panel["high"]
     l = panel["low"]
     v = panel["volume"]
-    vw = safe_div(panel["amount"], v * 100.0 + 1.0)
+    vw = vwap(panel, "equity_cn")
     mid = (h + l) / 2.0
     p1 = rank(decay_linear(mid + h - (vw + h), 20))
-    p2 = rank(decay_linear(ts_corr(mid, ts_mean(v, 30), 3), 6))
+    p2 = rank(decay_linear(ts_corr(mid, ts_mean(v, 40), 3), 6))
     return pd.DataFrame(np.minimum(p1.to_numpy(), p2.to_numpy()),
                         index=h.index, columns=h.columns)

@@ -84,19 +84,23 @@ def _register_live_slash_commands() -> None:
 
 
 _register_live_slash_commands()
-# QVERIS-INTEGRATION
-def _register_data_slash_commands() -> None:  # QVERIS-INTEGRATION
-    """Surface data routing mode in the shared slash registry."""  # QVERIS-INTEGRATION
-    from cli.commands import slash_router  # QVERIS-INTEGRATION
-    if any(cmd.name == "data" for cmd in slash_router.SLASH_COMMANDS):  # QVERIS-INTEGRATION
-        return  # QVERIS-INTEGRATION
-    commands = list(slash_router.SLASH_COMMANDS)  # QVERIS-INTEGRATION
-    quit_idx = next((i for i, c in enumerate(commands) if c.name == "quit"), len(commands))  # QVERIS-INTEGRATION
-    commands.insert(quit_idx, slash_router.Command("data", "Data routing mode", "cli.main"))  # QVERIS-INTEGRATION
-    slash_router.SLASH_COMMANDS = tuple(commands)  # QVERIS-INTEGRATION
-# QVERIS-INTEGRATION
-_register_data_slash_commands()  # QVERIS-INTEGRATION
-# QVERIS-INTEGRATION
+
+
+def _register_data_slash_commands() -> None:
+    """Surface data partner settings in the shared slash registry."""
+    from cli.commands import slash_router
+
+    if any(cmd.name == "data" for cmd in slash_router.SLASH_COMMANDS):
+        return
+    commands = list(slash_router.SLASH_COMMANDS)
+    quit_idx = next((i for i, c in enumerate(commands) if c.name == "quit"), len(commands))
+    commands.insert(quit_idx, slash_router.Command("data", "Show data partner settings", "cli.main"))
+    slash_router.SLASH_COMMANDS = tuple(commands)
+
+
+_register_data_slash_commands()
+
+
 _AGENT_DIR = Path(__file__).resolve().parents[1]
 _ENV_PATH = Path.home() / ".vibe-trading" / ".env"
 _PROJECT_ENV_PATH = _AGENT_DIR / ".env"
@@ -962,20 +966,24 @@ def _run_connector_command_from_repl(console: Any, args: list[str]) -> None:
         _dispatch_connector(parsed)
     except Exception as exc:  # noqa: BLE001 — never let a connector command kill the loop
         console.print(f"[bold red]/connector failed:[/bold red] {exc}")
-# QVERIS-INTEGRATION
-def _run_data_command_from_repl(console: Any, args: list[str]) -> None:  # QVERIS-INTEGRATION
-    """Run a ``/data ...`` subcommand from the REPL via the CLI dispatcher."""  # QVERIS-INTEGRATION
-    from cli._legacy import _build_parser, _dispatch_data  # QVERIS-INTEGRATION
-    argv = ["data", *(args or ["status"])]  # QVERIS-INTEGRATION
-    try:  # QVERIS-INTEGRATION
-        parsed = _build_parser().parse_args(argv)  # QVERIS-INTEGRATION
-    except SystemExit:  # QVERIS-INTEGRATION
-        console.print("[dim]Usage: /data [status|mode free|mode paid|usage][/dim]")  # QVERIS-INTEGRATION
-        return  # QVERIS-INTEGRATION
-    try:  # QVERIS-INTEGRATION
-        _dispatch_data(parsed)  # QVERIS-INTEGRATION
-    except Exception as exc:  # noqa: BLE001  # QVERIS-INTEGRATION
-        console.print(f"[bold red]/data failed:[/bold red] {exc}")  # QVERIS-INTEGRATION
+
+
+def _run_data_command_from_repl(console: Any, args: list[str]) -> None:
+    """Run a ``/data ...`` subcommand from the REPL via the CLI dispatcher."""
+    from cli._legacy import _build_parser, _dispatch_data
+
+    argv = ["data", *(args or ["status"])]
+    try:
+        parsed = _build_parser().parse_args(argv)
+    except SystemExit:
+        console.print("[dim]Usage: /data [status][/dim]")
+        return
+    try:
+        _dispatch_data(parsed)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[bold red]/data failed:[/bold red] {exc}")
+
+
 def _is_numeric_pick(text: str) -> Optional[int]:
     """Return the chosen ordinal if ``text`` is a bare numeric pick, else None.
 
@@ -1082,7 +1090,13 @@ def _render_scheduled_proposal(console: Any, proposal: Dict[str, Any]) -> None:
         console.print(
             f"  投递: {delivery.get('target_label') or '仅应用内'}{channel_suffix}"
         )
-    console.print("[bold]确认执行？ [y/N][/bold]")
+        if delivery.get("channel") == "email":
+            label = {"html": "HTML", "pdf": "PDF"}.get(delivery.get("format"), "纯文本")
+            console.print(f"  邮件格式: {label}")
+            if delivery.get("format") == "pdf":
+                protection = "开启" if delivery.get("protect_pdf") is True else "关闭"
+                console.print(f"  PDF 密码保护: {protection}")
+    console.print("确认执行？ [y/N]", style="bold", markup=False)
 
 
 def _handle_scheduled_proposal_reply(text: str, ctx: InteractiveContext) -> bool:
@@ -1126,7 +1140,43 @@ def _handle_scheduled_proposal_reply(text: str, ctx: InteractiveContext) -> bool
     return True
 
 
-def _commit_mandate(proposal: Dict[str, Any], selected_ordinal: int) -> Dict[str, Any]:
+def _choose_mandate_account(accounts: List[Dict[str, Any]]) -> str:
+    """Ask the user which broker account a mandate may trade.
+
+    Only accounts the broker lists as active and open to agentic trading are
+    offered, and nothing is preselected: an empty reply commits nothing.
+
+    Args:
+        accounts: Picker rows from ``GET /live/accounts``.
+
+    Returns:
+        The chosen ``account_ref``, or ``""`` when the user chose none or no
+        account is usable.
+    """
+    console = get_console()
+    usable = [row for row in accounts if not row.get("deactivated") and row.get("agentic_allowed")]
+    if not usable:
+        console.print("[yellow]The broker lists no active account that allows agentic trading.[/yellow]")
+        return ""
+    console.print("[bold]Which account may this mandate trade?[/bold]")
+    for index, row in enumerate(usable, start=1):
+        default = " [dim](broker default)[/dim]" if row.get("is_default") else ""
+        console.print(f"  [{index}] {row.get('label')}{default}")
+    try:
+        raw = input("account > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return ""
+    if not raw.isdigit() or not 1 <= int(raw) <= len(usable):
+        return ""
+    return str(usable[int(raw) - 1]["account_ref"])
+
+
+def _commit_mandate(
+    proposal: Dict[str, Any],
+    selected_ordinal: int,
+    *,
+    choose_account: Any = None,
+) -> Dict[str, Any]:
     """Commit a mandate selection via the surface commit endpoint.
 
     This is the single privileged write that activates a mandate. The pick is a
@@ -1142,6 +1192,10 @@ def _commit_mandate(proposal: Dict[str, Any], selected_ordinal: int) -> Dict[str
         proposal: The outstanding ``mandate.proposal`` payload (binds the commit
             to the exact rendered options via ``proposal_id``).
         selected_ordinal: The 1-based profile the user picked.
+        choose_account: Account chooser taking the ``/live/accounts`` rows;
+            defaults to :func:`_choose_mandate_account`. Used only for a broker
+            whose mandate must be bound to one account, and never fed an
+            account the proposal carries: the agent does not choose it.
 
     Returns:
         The decoded commit response (``mandate_id`` / ``consent_record_id`` on
@@ -1170,6 +1224,20 @@ def _commit_mandate(proposal: Dict[str, Any], selected_ordinal: int) -> Dict[str
                 "consent_ack": True,
             }
         ).model_dump(mode="json")
+
+        listing = httpx.get(
+            f"{base}/live/accounts",
+            params={"broker": body["broker"]},
+            headers=headers,
+            timeout=30.0,
+        )
+        listing.raise_for_status()
+        accounts = listing.json()
+        if accounts.get("account_selection_required"):
+            chooser = choose_account or _choose_mandate_account
+            body["account_ref"] = chooser(list(accounts.get("accounts") or []))
+            if not body["account_ref"]:
+                return {"status": "error", "error": "no account was chosen for this mandate"}
 
         response = httpx.post(
             f"{base}/mandate/commit",
@@ -1367,9 +1435,9 @@ def _interactive_loop(max_iter: int, resume_session_id: Optional[str] = None) ->
             if slash_name == "connector":
                 _run_connector_command_from_repl(console, slash_tokens[1:])
                 continue
-            if slash_name == "data":  # QVERIS-INTEGRATION
-                _run_data_command_from_repl(console, slash_tokens[1:])  # QVERIS-INTEGRATION
-                continue  # QVERIS-INTEGRATION
+            if slash_name == "data":
+                _run_data_command_from_repl(console, slash_tokens[1:])
+                continue
             rc = _dispatch_slash(text, ctx)
             if rc == 2:
                 break

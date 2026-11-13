@@ -1,6 +1,6 @@
 [project]
 name = "vibe-trading-ai"
-version = "0.1.14"
+version = "0.1.19"
 description = "Natural-language finance research AI agent with backtesting"
 requires-python = ">=3.11"
 license = "MIT"
@@ -23,7 +23,7 @@ dependencies = [
     "langchain>=1.3.9,<2",
     "langchain-core>=1.0.0,<2",
     "langchain-openai>=1.0.0,<2",
-    "langgraph>=1.2.5,<1.3",
+    "langgraph>=1.2.14,<1.3",
     "langgraph-checkpoint>=2.1.0,<5",
     "python-dotenv>=1.0.0",
     "httpx>=0.28.0",
@@ -35,7 +35,8 @@ dependencies = [
     "python-docx>=1.1.0",
     "python-pptx>=0.6.23",
     "pypdfium2>=4.0.0",
-    "Pillow>=12.2.0",
+    "pypdf>=6.21.2",
+    "Pillow>=13.0.0",
     "numpy>=1.24.0",
     "scipy>=1.10.0",
     "bottleneck>=1.3.7",
@@ -47,8 +48,19 @@ dependencies = [
     "yfinance>=0.2.30",
     "akshare>=1.12.0",
     "ccxt>=4.5.71",
-    "aiohttp>=3.14.3",
+    "aiohttp>=3.14.4",
     "cryptography>=50.0.0",
+    # Security floors for the MCP/auth and HTTP dependency closures. Keep
+    # these in agent/requirements.txt too so all install paths reject old pins.
+    "authlib>=1.9.1",
+    "brotli>=1.2.1; platform_python_implementation == 'CPython'",
+    "brotlicffi>=1.2.1.0; platform_python_implementation != 'CPython'",
+    "certifi>=2026.10.18",
+    "dnspython>=2.9.0",
+    "joserfc>=1.7.6",
+    "langgraph-sdk>=0.4.6",
+    "urllib3>=2.8.0",
+    "opentelemetry-api>=1.45.1",
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
     "websockets>=12.0",
@@ -58,11 +70,31 @@ dependencies = [
     # 4.0.0 changed MCPError's constructor (message is now separate) and the
     # session snapshot shape; tests construct it the 2.x way. Cap until the
     # adaptation lands.
-    "fastmcp>=2.14.0,<4.0.0",
+    "fastmcp>=3.4.10,<4.0.0",
+    # 1.30.0 reclaims Streamable HTTP sessions (idle timeout 1800 s, at most
+    # 10,000 sessions, ended sessions dropped), which `--transport http` needs:
+    # CVE-2026-59951 / GHSA-84m7-p3x7-pcfv. It also enforces RFC 8414 section
+    # 3.3 (metadata `issuer` must equal the advertised authorization server),
+    # which is why 0.1.15-0.1.17 capped it below 1.30: IBKR advertised
+    # https://api.ibkr.com/oauth2 with `"issuer": "https://api.ibkr.com"`.
+    # Verified live 2026-10-21: IBKR's protected-resource metadata now names
+    # https://api.ibkr.com, matching the issuer at all three well-known paths,
+    # and Robinhood's issuer equals its advertised server. Pulled in
+    # transitively through fastmcp, which allows mcp<2.0.
+    "mcp>=1.30.0",
     "ddgs>=6.0.0",
     "jinja2>=3.1.0",
     "matplotlib>=3.7.0",
+    "mistune>=3.0.0",
+    "nh3>=0.2.18",
     "weasyprint>=60.0",
+    # weasyprint needs system pango/cairo libraries pip cannot install; where
+    # they are missing the shadow report degraded to HTML-only. reportlab
+    # ships binary wheels everywhere and backs the pure-Python PDF fallback
+    # (shadow_account/pdf_fallback.py) so the PDF renders on any host.
+    "reportlab>=4.0",
+    "arabic-reshaper>=3.0.1",
+    "python-bidi>=0.6.11",
     "prompt_toolkit>=3.0.0",
 ]
 
@@ -82,7 +114,7 @@ py-modules = ["api_server", "mcp_server"]
 
 [tool.setuptools.packages.find]
 where = ["agent"]
-include = ["src*", "backtest*", "cli*"]
+include = ["src*", "backtest*", "cli*", "evals*"]
 
 [tool.setuptools.package-data]
 "src" = [
@@ -91,14 +123,22 @@ include = ["src*", "backtest*", "cli*"]
     "skills/**/*.json",
     "skills/**/*.py",
     "providers/*.json",
+    "agent/*.json",
+    "tools/paper_trade/*.json",
+    "tools/paper_trade/*.md",
+    "pixel_agents/*.json",
     "scheduled_research/playbooks/*.md",
     "swarm/presets/*.yaml",
     "shadow_account/templates/*.j2",
     "shadow_account/templates/*.html",
     "shadow_account/templates/*.css",
+    "shadow_account/assets/*.ttf",
+    "shadow_account/assets/*.txt",
+    "shadow_account/assets/*.md",
 ]
-"backtest" = ["*.py"]
-"src.factors" = ["zoo/**/*.yaml", "zoo/**/*.md", "zoo/**/NOTICE"]
+"evals.harness" = ["README.md", "cases/**/*.json"]
+"backtest" = ["*.py", "loaders/*.json"]
+"src.factors" = ["*.json", "zoo/**/*.yaml", "zoo/**/*.md", "zoo/**/NOTICE"]
 
 [project.optional-dependencies]
 ibkr = [
@@ -112,6 +152,18 @@ mt5 = [
     # (broker connector + mt5 data loader). Lazy-imported; on other platforms
     # the marker makes this a no-op and everything degrades gracefully.
     "MetaTrader5>=5.0.45; sys_platform == 'win32'",
+]
+zerodha = [
+    # Zerodha Kite Connect (India NSE/BSE) broker connector + india_broker
+    # loader backend. Lazy-imported with a named error; zerodha_available()
+    # stays False (loader falls through to Shoonya/Dhan) until installed.
+    "kiteconnect>=4.0.0",
+]
+upbit = [
+    # Upbit (Korea, KRW crypto) broker connector JWT signing. Lazy-imported
+    # with a named error naming this extra; upbit_jwt_available() stays False
+    # until installed.
+    "PyJWT>=2.8.0",
 ]
 deepseek = [
     "langchain-deepseek>=1.0.0,<2",
@@ -256,6 +308,7 @@ pythonpath = ["agent"]
 markers = [
     "unit: Unit tests (fast, no network)",
     "integration: Integration tests (may need network)",
+    "slow: Paper-trade performance-budget gates; run at the delivery gate",
 ]
 
 [tool.ruff]

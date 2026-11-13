@@ -17,19 +17,27 @@ All helpers raise ``ValueError`` on rejection — callers already expect this.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from src.config.accessor import get_env_config
 
 _ALLOWED_FILE_ROOTS_ENV = "VIBE_TRADING_ALLOWED_FILE_ROOTS"
 _ALLOWED_RUN_ROOTS_ENV = "VIBE_TRADING_ALLOWED_RUN_ROOTS"
+_ALLOWED_WRITE_ROOTS_ENV = "VIBE_TRADING_ALLOWED_WRITE_ROOTS"
 
 # MCP clients spawn the server themselves, so a shell export never reaches it.
 _ENV_SCOPE_HINT = (
-    "Under an MCP client, set it in that client's server env block — "
-    "exporting it in a shell does not reach the spawned server."
+    "Put it in the runtime .env (read by both the web and MCP servers) or "
+    "in the MCP client's server env block — exporting it in a shell does not "
+    "reach a spawned MCP server."
 )
+
+# The env var that widens each resolve_safe_path purpose; rejections name it
+# so the escape hatch is discoverable from the error itself.
+_PURPOSE_ENV_HINTS = {
+    "write": _ALLOWED_WRITE_ROOTS_ENV,
+    "file": _ALLOWED_FILE_ROOTS_ENV,
+}
 
 
 def _describe_roots(roots: list[Path]) -> str:
@@ -41,6 +49,25 @@ def _rejects_unc(p: str) -> None:
     """Raise ValueError if `p` starts with a UNC share prefix."""
     if p.startswith("\\\\") or p.startswith("//"):
         raise ValueError(f"UNC paths are not allowed: {p!r}")
+
+
+def _contained_path(candidate: Path, root: Path) -> Path | None:
+    """Resolve containment using filesystem identity for existing root aliases.
+
+    A case-insensitive filesystem can resolve ``dropbox`` and ``Dropbox`` to
+    the same directory while Path.resolve preserves the spelling. Only accept
+    such an alias when samefile proves it; never case-fold authorization paths.
+    """
+    root = root.resolve()
+    if candidate.is_relative_to(root):
+        return candidate
+    for ancestor in (candidate, *candidate.parents):
+        try:
+            if ancestor.samefile(root):
+                return root / candidate.relative_to(ancestor)
+        except OSError:
+            continue
+    return None
 
 
 def safe_path(p: str, workdir: Path) -> Path:
@@ -67,11 +94,10 @@ def safe_path(p: str, workdir: Path) -> Path:
         resolved = expanded.resolve()
     else:
         resolved = (base / p).resolve()
-    try:
-        resolved.relative_to(base)
-    except ValueError as exc:
-        raise ValueError(f"Path {p!r} escapes the workspace root") from exc
-    return resolved
+    contained = _contained_path(resolved, base)
+    if contained is None:
+        raise ValueError(f"Path {p!r} escapes the workspace root")
+    return contained
 
 
 def _agent_root() -> Path:
@@ -144,9 +170,6 @@ def allowed_file_roots() -> list[Path]:
     return roots
 
 
-_ALLOWED_WRITE_ROOTS_ENV = "VIBE_TRADING_ALLOWED_WRITE_ROOTS"
-
-
 def allowed_write_roots() -> list[Path]:
     """Return all roots allowed for file writes and edits."""
     raw = get_env_config().api.vibe_trading_allowed_write_roots
@@ -182,6 +205,12 @@ def allowed_write_roots() -> list[Path]:
     return roots
 
 
+def _fallback_candidate(file_path: str, base: Path) -> Path:
+    """Resolve a fallback against the supplied run directory, not the CWD."""
+    candidate = Path(file_path).expanduser()
+    return (candidate if candidate.is_absolute() else base / candidate).resolve()
+
+
 def resolve_safe_path(
     file_path: str,
     run_dir: str | None,
@@ -205,38 +234,48 @@ def resolve_safe_path(
     """
     _rejects_unc(file_path)
 
+    hint_env = _PURPOSE_ENV_HINTS.get(purpose)
+    hint = f"\nSet {hint_env} to add a directory. {_ENV_SCOPE_HINT}" if hint_env else ""
+
     # Try resolving against run_dir if provided
     if run_dir:
+        # A rejected network path must never enter the fallback resolver.
+        _rejects_unc(run_dir)
         try:
             run_root = safe_run_dir(run_dir)
         except ValueError as exc:
             # If safe_run_dir fails, check if the path is in allowed_roots first
-            candidate = Path(file_path).expanduser().resolve()
+            candidate = _fallback_candidate(file_path, Path(run_dir).expanduser())
             for root in allowed_roots:
-                if candidate.is_relative_to(root):
-                    return candidate
+                contained = _contained_path(candidate, root)
+                if contained is not None:
+                    return contained
             raise exc
 
         try:
             return safe_path(file_path, run_root)
         except ValueError as exc:
             # Fallback to allowed roots if safe_path containment fails
-            candidate = Path(file_path).expanduser().resolve()
+            candidate = _fallback_candidate(file_path, run_root)
             for root in allowed_roots:
-                if candidate.is_relative_to(root):
-                    return candidate
+                contained = _contained_path(candidate, root)
+                if contained is not None:
+                    return contained
             raise ValueError(
-                f"Path {file_path!r} escapes run_dir {run_dir!r} and is not in allowed {purpose} roots."
+                f"Path {file_path!r} escapes run_dir {run_dir!r} and is not in allowed {purpose} roots.\n"
+                f"{_describe_roots(allowed_roots)}{hint}"
             ) from exc
 
     # If no run_dir, path must resolve inside one of the allowed roots
     candidate = Path(file_path).expanduser().resolve()
     for root in allowed_roots:
-        if candidate.is_relative_to(root):
-            return candidate
+        contained = _contained_path(candidate, root)
+        if contained is not None:
+            return contained
 
     raise ValueError(
-        f"run_dir is required to write/edit {file_path!r}, or the path must resolve inside allowed {purpose} roots."
+        f"run_dir is required to write/edit {file_path!r}, or the path must resolve inside allowed {purpose} roots.\n"
+        f"{_describe_roots(allowed_roots)}{hint}"
     )
 
 

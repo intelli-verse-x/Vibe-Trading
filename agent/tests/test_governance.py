@@ -207,6 +207,18 @@ def test_manifest_verify_hash_detects_tampering_after_deserialize() -> None:
     assert tampered.verify_hash() is False
 
 
+def test_manifest_verify_hash_detects_an_edited_tool_list() -> None:
+    original = build_run_manifest(**_base_manifest_kwargs())
+    data = original.to_dict()
+    # Tamper: add a tool name while keeping the stored tools_hash/manifest_hash.
+    data["tools"]["tool_names"].append("zz_injected_tool")
+    assert RunManifest.from_dict(data).verify_hash() is False
+
+    data = original.to_dict()
+    data["tools"]["tool_names"] = data["tools"]["tool_names"][1:]
+    assert RunManifest.from_dict(data).verify_hash() is False
+
+
 def test_manifest_rejects_duplicate_skill_names_in_sequence_form() -> None:
     from src.governance.manifest import SkillRecord
 
@@ -382,6 +394,17 @@ def test_only_asserting_untampered_pass_would_be_insufficient_so_also_assert_ok_
     path = tmp_path / "chain.jsonl"
     _write_five_records(path)
     assert verify_chain(path) == ChainVerificationResult(ok=True, record_count=5, first_break=None)
+
+
+def test_append_record_keeps_unicode_line_separator_in_payload(tmp_path: Path) -> None:
+    path = tmp_path / "chain.jsonl"
+    append_record(path, {"note": "before\u2028after\u2029end"})
+    append_record(path, {"note": "second"})
+
+    result = verify_chain(path)
+    assert result == ChainVerificationResult(ok=True, record_count=2, first_break=None)
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
+    assert records[0]["note"] == "before\u2028after\u2029end"
 
 
 def test_append_record_refuses_to_extend_an_already_broken_chain(tmp_path: Path) -> None:
@@ -720,6 +743,35 @@ def test_the_chain_continues_across_a_rotation(tmp_path):
     assert result.record_count == 9
 
 
+def test_a_second_rotation_is_not_refused_as_corruption(tmp_path):
+    # Rotation guards itself by verifying the chain first, which is right --
+    # but the active file after the FIRST rotation legitimately starts mid
+    # chain (seq 6 above), so verifying that file alone reports a seq_gap and
+    # a healthy ledger can never be sealed twice. The guard has to ask the
+    # same question the module's own whole-history verifier asks.
+    from src.governance.ledger import (
+        archive_segments,
+        rotate_if_needed,
+        verify_chain_with_archives,
+    )
+
+    led = tmp_path / "audit_chain.jsonl"
+    for i in range(5):
+        append_record(led, {"action": "order", "n": i})
+    first = rotate_if_needed(led, max_bytes=100)
+    for i in range(5, 10):
+        append_record(led, {"action": "order", "n": i})
+
+    assert verify_chain_with_archives(led).ok is True  # nothing is wrong here
+
+    second = rotate_if_needed(led, max_bytes=100)
+
+    assert second is not None
+    assert second != first
+    assert archive_segments(led) == [first, second]
+    assert verify_chain_with_archives(led).ok is True
+
+
 def test_deleting_a_whole_sealed_segment_is_detected(tmp_path):
     # This is what rotation would have cost us if the chain restarted: a
     # segment could be removed wholesale and each remaining file would still
@@ -738,6 +790,40 @@ def test_deleting_a_whole_sealed_segment_is_detected(tmp_path):
     result = verify_chain_with_archives(led)
     assert result.ok is False
     assert result.first_break.reason == "seq_gap"
+
+
+def test_a_malformed_line_in_a_sealed_segment_is_reported_not_raised(tmp_path):
+    """verify_chain already reports malformed JSON as a clean ChainBreak
+    instead of letting json.JSONDecodeError escape; the whole-history
+    verifier must do the same for the exact same corruption, whether it
+    lands in a sealed segment or the active file."""
+    from src.governance.ledger import rotate_if_needed, verify_chain_with_archives
+
+    led = tmp_path / "audit_chain.jsonl"
+    for i in range(5):
+        append_record(led, {"action": "order", "n": i})
+    archive = rotate_if_needed(led, max_bytes=100)
+    append_record(led, {"action": "order", "n": 5})
+
+    with archive.open("a", encoding="utf-8") as handle:
+        handle.write("{not valid json\n")
+
+    result = verify_chain_with_archives(led)
+    assert result.ok is False
+    assert result.first_break.reason == "malformed_json"
+
+
+def test_a_malformed_line_in_the_active_file_is_reported_not_raised(tmp_path):
+    from src.governance.ledger import verify_chain_with_archives
+
+    led = tmp_path / "audit_chain.jsonl"
+    append_record(led, {"action": "order", "n": 0})
+    with led.open("a", encoding="utf-8") as handle:
+        handle.write("{not valid json\n")
+
+    result = verify_chain_with_archives(led)
+    assert result.ok is False
+    assert result.first_break.reason == "malformed_json"
 
 
 def test_rotation_refuses_to_seal_a_corrupt_ledger(tmp_path):

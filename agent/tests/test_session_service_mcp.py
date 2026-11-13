@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import asyncio
 import time
 from pathlib import Path
+
+import pytest
 
 from src.session.events import EventBus
 from src.session.models import Attempt
@@ -21,7 +26,17 @@ class _DummyIndex:
 
 
 class _DummyAgentLoop:
-    def __init__(self, *, registry, llm, event_callback, max_iterations, persistent_memory) -> None:
+    def __init__(
+        self,
+        *,
+        registry,
+        llm,
+        event_callback,
+        max_iterations,
+        persistent_memory,
+        cancel_event=None,
+        background_manager=None,
+    ) -> None:
         del registry, llm, event_callback, max_iterations, persistent_memory
 
     def run(self, *, user_message: str, history, session_id: str) -> dict[str, str]:
@@ -29,10 +44,24 @@ class _DummyAgentLoop:
         return {"status": "completed"}
 
 
+@pytest.mark.parametrize(("configured_cap", "expected_cap"), [(None, 50), ("73", 73)])
 def test_run_with_agent_keeps_event_loop_responsive_during_registry_build(
     monkeypatch,
     tmp_path: Path,
+    configured_cap: str | None,
+    expected_cap: int,
 ) -> None:
+    monkeypatch.setattr("src.config.accessor._instance", None)
+    if configured_cap is None:
+        monkeypatch.delenv("VIBE_TRADING_AGENT_MAX_ITERATIONS", raising=False)
+    else:
+        monkeypatch.setenv("VIBE_TRADING_AGENT_MAX_ITERATIONS", configured_cap)
+    received_caps: list[int] = []
+
+    def _agent_factory(**kwargs):
+        received_caps.append(kwargs["max_iterations"])
+        return _DummyAgentLoop(**kwargs)
+
     def _slow_build_registry(**kwargs):
         del kwargs
         time.sleep(0.25)
@@ -40,9 +69,10 @@ def test_run_with_agent_keeps_event_loop_responsive_during_registry_build(
 
     monkeypatch.setattr("src.session.service.get_shared_index", lambda: _DummyIndex())
     monkeypatch.setattr("src.tools.build_registry", _slow_build_registry)
-    monkeypatch.setattr("src.providers.chat.ChatLLM", lambda: object())
+    llm = SimpleNamespace(aclose=AsyncMock())
+    monkeypatch.setattr("src.providers.chat.ChatLLM", lambda: llm)
     monkeypatch.setattr("src.memory.persistent.PersistentMemory", lambda: object())
-    monkeypatch.setattr("src.agent.loop.AgentLoop", _DummyAgentLoop)
+    monkeypatch.setattr("src.agent.loop.AgentLoop", _agent_factory)
     monkeypatch.setattr("src.config.loader.load_runtime_agent_config", lambda overrides=None: object())
     monkeypatch.setattr("src.config.loader.sanitize_session_overrides", lambda overrides: dict(overrides))
 
@@ -67,6 +97,25 @@ def test_run_with_agent_keeps_event_loop_responsive_during_registry_build(
 
     tick_times, result = asyncio.run(_exercise())
 
+    llm.aclose.assert_awaited_once()
     assert result["status"] == "completed"
+    assert received_caps == [expected_cap]
     assert tick_times, "Expected the event loop ticker to run while registry build was pending"
     assert tick_times[0] < 0.18, f"Registry build blocked the event loop for too long: {tick_times[0]:.3f}s"
+
+
+def test_registry_failure_closes_attempt_owned_llm(monkeypatch, tmp_path):
+    llm = SimpleNamespace(aclose=AsyncMock())
+    monkeypatch.setattr("src.providers.chat.ChatLLM", lambda: llm)
+    monkeypatch.setattr("src.session.service.get_shared_index", lambda: _DummyIndex())
+    monkeypatch.setattr("src.memory.persistent.PersistentMemory", lambda: object())
+    monkeypatch.setattr("src.config.loader.load_runtime_agent_config", lambda **kw: object())
+    def fail(**kwargs):
+        raise RuntimeError("registry construction failed")
+    monkeypatch.setattr("src.tools.build_registry", fail)
+    service = SessionService(store=SessionStore(tmp_path / "sessions"),
+                             event_bus=EventBus(), runs_dir=tmp_path / "runs")
+    attempt = Attempt(session_id="session-1", prompt="hello")
+    with pytest.raises(RuntimeError, match="registry construction failed"):
+        asyncio.run(service._run_with_agent(attempt))
+    llm.aclose.assert_awaited_once()

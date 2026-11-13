@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { useSearchParams } from "react-router";
-import { ArrowDown } from "lucide-react";
+import { ArrowDown, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import {
   useAgentStore,
@@ -10,12 +10,13 @@ import {
   type StoredAgentMessage,
 } from "@/stores/agent";
 import { useSSE } from "@/hooks/useSSE";
-import { ApiError, AUTH_REQUIRED_MESSAGE, api, isAuthRequiredError, type GoalSnapshot, type MandateProposal, type MandateCommitted, type ScheduledResearchProposal, type LiveAction, type LiveHalted, type LLMSettings } from "@/lib/api";
+import { useLlmUsageCounter } from "@/hooks/useLlmUsageCounter";
+import { ApiError, AUTH_REQUIRED_MESSAGE, api, isAuthRequiredError, type GoalSnapshot, type MandateProposal, type MandateCommitted, type ScheduledResearchProposal, type LiveAction, type LiveHalted, type LLMSettings, type RunPreview } from "@/lib/api";
 import {
   extractUploadedAttachments,
-  prependUploadedAttachments,
 } from "@/lib/attachments";
-import { isReportWorthyRun } from "@/lib/runReports";
+import { hasStoredMetrics, runCardFields } from "@/lib/runCards";
+import { buildChatPrompt, MAX_GOAL_CHARS, MAX_MESSAGE_CHARS, promptExceedsLimit, SWARM_PROMPT_PREFIX } from "@/lib/chatPrompt";
 import type { AgentMessage, SwarmRunStatus, ToolCallEntry } from "@/types/agent";
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
 import { WelcomeScreen } from "@/components/chat/WelcomeScreen";
@@ -24,6 +25,7 @@ import { ModelRuntimeBar } from "@/components/chat/ModelRuntimeBar";
 import { ThinkingTimeline } from "@/components/chat/ThinkingTimeline";
 import { ConversationTimeline } from "@/components/chat/ConversationTimeline";
 import { ActivityLine } from "@/components/chat/ActivityLine";
+import { LlmUsageCounter } from "@/components/chat/LlmUsageCounter";
 import { MandateProposalCard } from "@/components/chat/MandateProposalCard";
 import { ScheduledResearchProposalCard } from "@/components/chat/ScheduledResearchProposalCard";
 import { SwarmStatusCard } from "@/components/chat/SwarmStatusCard";
@@ -40,8 +42,11 @@ import {
 } from "@/components/chat/LiveRuntimePanel";
 import {
   applySwarmEvent,
+  buildSwarmStatusFromRunDetail,
   buildSwarmStatusFromStarted,
   buildSwarmStatusFromToolResultPreview,
+  mergeSwarmRunUsage,
+  stopSwarmRun,
 } from "@/lib/swarmStatus";
 import { buildToolTimelineMessages } from "@/pages/agentToolTimeline";
 
@@ -76,6 +81,15 @@ function groupMessages(msgs: StoredAgentMessage[]): MsgGroup[] {
 
 const act = () => useAgentStore.getState();
 
+function hydrateSwarmRunUsage(runId: string): void {
+  void api.getSwarmRun(runId).then((payload) => {
+    const current = act().swarmRuns[runId]
+      ?? buildSwarmStatusFromRunDetail(payload, runId);
+    if (!current) return;
+    act().upsertSwarmStatus(mergeSwarmRunUsage(current, payload));
+  }).catch(() => undefined);
+}
+
 function eventCallId(data: Record<string, unknown>): string | undefined {
   return typeof data.call_id === "string" && data.call_id
     ? data.call_id
@@ -95,6 +109,12 @@ interface RuntimeIdentity {
   reasoningEffort?: string;
 }
 
+/** A final answer held back while the grounding gate re-checks a revised draft. */
+interface GroundingRevision {
+  attemptId: string;
+  round: number;
+}
+
 function toolProgressKey(callId: string | undefined, tool: string): string {
   return callId ? `call:${callId}` : `tool:${tool}`;
 }
@@ -104,8 +124,6 @@ function toolProgressKey(callId: string | undefined, tool: string): string {
 
 const STREAM_FLUSH_INTERVAL_MS = 80;
 const TIMELINE_WINDOW_SIZE = 160;
-const SWARM_PROMPT_PREFIX =
-  "[Swarm Team Mode] Use the swarm tool to assemble the best specialist team for this task. Auto-select the most appropriate preset.\n\n";
 const GOAL_KICKOFF_PREFIX = [
   "Start working on this research goal now.",
   "Keep it research-only, use available tools when evidence is needed, add concrete evidence to the goal ledger, and keep going until the goal is complete, blocked, waiting for user input, or budget-limited.",
@@ -240,6 +258,7 @@ export function Agent() {
   const replayCheckTimerRef = useRef(0);
   const smoothScrollingRef = useRef(false);
   const smoothScrollTimerRef = useRef(0);
+  const historyScrollTimerRef = useRef(0);
   const titleBeforeCompletionRef = useRef<string | null>(null);
   const completedAttemptIdsRef = useRef<Set<string>>(new Set());
 
@@ -249,9 +268,11 @@ export function Agent() {
 
   /* Connector runtime channel state (SPEC Consent §1/§4/§5) */
   const [liveItems, setLiveItems] = useState<LiveItem[]>([]);
+  const [groundingRevision, setGroundingRevision] = useState<GroundingRevision | null>(null);
   const [visibleRowCount, setVisibleRowCount] = useState(TIMELINE_WINDOW_SIZE);
   const visibleRowsSessionRef = useRef<string | null>(null);
   const [llmSettings, setLlmSettings] = useState<LLMSettings | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const [runtimeIdentity, setRuntimeIdentity] = useState<RuntimeIdentity>({});
 
   const messages = useAgentStore(s => s.messages);
@@ -265,6 +286,14 @@ export function Agent() {
   const previousStatusRef = useRef(status);
 
   const { connect, disconnect, onStatusChange } = useSSE();
+
+  /* Live token totals for the in-flight attempt, fed by `llm_usage` events. */
+  const {
+    input: usageInput,
+    output: usageOutput,
+    record: recordLlmUsage,
+    reset: resetLlmUsage,
+  } = useLlmUsageCounter();
 
   const urlSessionId = searchParams.get("session");
   const visibleRuntimeIdentity = runtimeIdentity.sessionId === urlSessionId
@@ -312,6 +341,14 @@ export function Agent() {
       }
     });
   }, [isNearBottom]);
+
+  const scheduleHistoryScroll = useCallback(() => {
+    window.clearTimeout(historyScrollTimerRef.current);
+    historyScrollTimerRef.current = window.setTimeout(() => {
+      historyScrollTimerRef.current = 0;
+      forceScrollToBottom();
+    }, 50);
+  }, [forceScrollToBottom]);
 
   const flushPendingStreamUpdate = useCallback(() => {
     window.clearTimeout(streamFlushTimerRef.current);
@@ -480,6 +517,7 @@ export function Agent() {
   const doDisconnect = useCallback(() => {
     cancelPendingStreamFlush();
     window.clearTimeout(replayCheckTimerRef.current);
+    window.clearTimeout(historyScrollTimerRef.current);
     disconnect();
     sseSessionRef.current = null;
   }, [cancelPendingStreamFlush, disconnect]);
@@ -506,9 +544,21 @@ export function Agent() {
   }, []);
 
   const loadSessionMessages = useCallback(async (sid: string, gen: number) => {
+    setHistoryError(null);
     try {
       const msgs = await api.getSessionMessages(sid);
       if (genRef.current !== gen) return;
+      // Every assistant turn owns a run directory, so most of these are plain
+      // replies. Request all previews up front rather than one per message.
+      const previews = new Map<string, Promise<RunPreview | null>>();
+      for (const m of msgs) {
+        const meta = m.metadata as Record<string, unknown> | undefined;
+        const runId = meta?.run_id as string | undefined;
+        const metrics = meta?.metrics as Record<string, number> | undefined;
+        if (m.role !== "user" && runId && !hasStoredMetrics(metrics) && !previews.has(runId)) {
+          previews.set(runId, api.getRunPreview(runId).catch(() => null));
+        }
+      }
       const agentMsgs: StoredAgentMessage[] = [];
       let latestRuntimeIdentity: RuntimeIdentity | null = null;
       for (const m of msgs) {
@@ -534,6 +584,16 @@ export function Agent() {
           };
         }
         const ts = new Date(m.created_at).getTime();
+        // The reply is committed when the attempt ends, so created_at is the
+        // end. The start comes from the persisted attempt start when present,
+        // else is backed out of the attempt's elapsed time; only legacy rows
+        // without either fall back to the first tool call.
+        const startedAtSec = typeof meta?.started_at === "number" ? meta.started_at : NaN;
+        const attemptStartedAt = Number.isFinite(startedAtSec) && startedAtSec > 0
+          ? startedAtSec * 1000
+          : elapsedMs != null
+            ? ts - elapsedMs
+            : undefined;
         const toolTimeline = m.role === "assistant"
           ? buildToolTimelineMessages(m.tool_trail ?? [], {
               fallbackTimestamp: ts,
@@ -544,6 +604,7 @@ export function Agent() {
                 : meta?.status === "cancelled"
                   ? "stopped"
                   : "done",
+              startedAt: attemptStartedAt,
               endedAt: ts,
             })
           : [];
@@ -566,35 +627,12 @@ export function Agent() {
           if (m.content && m.content !== "Strategy execution completed.") {
             agentMsgs.push({ id: m.message_id + "_ans", type: "answer", content: m.content, elapsed_ms: elapsedMs, timestamp: assistantTs });
           }
-          if (metrics && Object.keys(metrics).length > 0) {
+          if (hasStoredMetrics(metrics)) {
             agentMsgs.push({ id: m.message_id, type: "run_complete", content: "", runId, metrics, timestamp: assistantTs + 1 });
           } else {
-            // Fetch run data to check report-worthiness; show fallback card if fetch fails
-            let fetchedMetrics: Record<string, number> | undefined;
-            let fetchedCurve: Array<{ time: string; equity: number }> | undefined;
-            let showCard = false;
-            try {
-              const runData = await api.getRun(runId);
-              if (isReportWorthyRun(runData)) {
-                fetchedMetrics = runData.metrics;
-                fetchedCurve = runData.equity_curve?.map((e) => ({ time: e.time, equity: Number(e.equity) }));
-                showCard = true;
-              }
-              // succeeded but not report-worthy (plain chat turn) → skip card
-            } catch {
-              // fetch failed (auth/404/network) → can't tell, show link as fallback
-              showCard = true;
-            }
-            if (showCard) {
-              agentMsgs.push({
-                id: m.message_id,
-                type: "run_complete",
-                content: "",
-                runId,
-                metrics: fetchedMetrics,
-                equityCurve: fetchedCurve,
-                timestamp: assistantTs + 1,
-              });
+            const card = runCardFields((await previews.get(runId)) ?? null);
+            if (card) {
+              agentMsgs.push({ id: m.message_id, type: "run_complete", content: "", runId, ...card, timestamp: assistantTs + 1 });
             }
           }
         } else {
@@ -619,16 +657,33 @@ export function Agent() {
         act().clearStreamingSession(sid);
       }
       act().loadHistory(agentMsgs);
+      // The live activity is carried across a same-session re-mount so its
+      // clock survives, but if the attempt finished while we were away its
+      // committed reply is now in history: the durable row above supersedes
+      // the live one, which would otherwise sit at "Working" until the safety
+      // timeout fired.
+      const liveActivity = act().activity;
+      if (
+        liveActivity
+        && msgs.some((message) => (
+          message.role === "assistant"
+          && message.linked_attempt_id === liveActivity.attemptId
+        ))
+      ) {
+        useAgentStore.setState({ activity: null, toolCalls: [] });
+        if (act().status === "streaming") act().setStatus("idle");
+      }
       act().setSessionLoading(false);
       act().cacheSession(sid, agentMsgs);
       setRuntimeIdentity(latestRuntimeIdentity ?? {});
-      setTimeout(() => forceScrollToBottom(), 50);
-    } catch {
+      scheduleHistoryScroll();
+    } catch (error) {
       if (genRef.current !== gen) return;
       setRuntimeIdentity({});
       act().setSessionLoading(false);
+      setHistoryError(error instanceof Error ? error.message : t("settings.unknownError"));
     }
-  }, [forceScrollToBottom]);
+  }, [scheduleHistoryScroll, t]);
 
   const refreshSessionMessages = useCallback(async (sid: string) => {
     const gen = genRef.current + 1;
@@ -684,8 +739,15 @@ export function Agent() {
         return false;
       }
       const current = store.activity;
+      // `attempt.started` carries the backend's wall-clock start (epoch
+      // seconds). On a replayed stream that is the original start, so the
+      // elapsed timer resumes from the truth rather than from reconnect time.
+      const startedAtSec = Number(data.started_at);
+      const startedAt = Number.isFinite(startedAtSec) && startedAtSec > 0
+        ? startedAtSec * 1000
+        : undefined;
       if (!current) {
-        store.startActivity(attemptId || `pending-${Date.now()}`);
+        store.startActivity(attemptId || `pending-${Date.now()}`, startedAt);
       } else if (
         attemptId &&
         current.attemptId !== attemptId &&
@@ -693,7 +755,7 @@ export function Agent() {
       ) {
         store.setActivityAttemptId(attemptId);
       } else if (attemptId && current.attemptId !== attemptId) {
-        store.startActivity(attemptId);
+        store.startActivity(attemptId, startedAt);
       }
       act().setActivityState(state);
       return true;
@@ -703,10 +765,23 @@ export function Agent() {
       text_delta: (d) => {
         touch();
         replayAttemptSeenRef.current = true;
+        // Answer text only streams once the grounding gate has released it.
+        setGroundingRevision(null);
         if (!identifyActivity(d, "responding")) return;
         if (act().status !== "streaming") act().setStatus("streaming");
         queueStreamUpdate(String(d.delta || ""), false);
       },
+      llm_waiting: (d) => {
+        touch();
+        replayAttemptSeenRef.current = true;
+        identifyActivity(d, "thinking");
+      },
+      llm_usage: (d) => {
+        touch();
+        replayAttemptSeenRef.current = true;
+        recordLlmUsage(String(d.attempt_id || ""), Number(d.iter || 0), d);
+      },
+
       reasoning_delta: (d) => {
         touch();
         replayAttemptSeenRef.current = true;
@@ -725,9 +800,32 @@ export function Agent() {
       },
       thinking_done: () => { touch(); /* don't flush — keep streaming text visible */ },
 
+      grounding_status: (d) => {
+        touch();
+        replayAttemptSeenRef.current = true;
+        if (d.stage !== "revising") {
+          // released_redacted: the cut answer (with its own footnote) follows
+          // as text_delta; the status line has nothing left to say.
+          setGroundingRevision(null);
+          return;
+        }
+        if (typeof d.round !== "number" || d.round < 1) return;
+        if (!identifyActivity(d, "thinking")) return;
+        if (act().status !== "streaming") act().setStatus("streaming");
+        const attemptId = act().activity?.attemptId;
+        if (!attemptId) return;
+        // Pinned to the attempt so a line from a run that ended without text
+        // (timeout, cancel, failure) never resurfaces on the next attempt.
+        setGroundingRevision({ attemptId, round: d.round });
+        scrollToBottom();
+      },
+
       tool_call: (d) => {
         touch();
         replayAttemptSeenRef.current = true;
+        // A recovery round fetches evidence before the next draft; the tool
+        // activity line says what is happening, so the status line steps aside.
+        setGroundingRevision(null);
         if (!identifyActivity(d, "working")) return;
         queueStreamUpdate("", false);
         const toolName = String(d.tool || "");
@@ -760,6 +858,7 @@ export function Agent() {
           const fallback = buildSwarmStatusFromToolResultPreview(String(d.preview || ""));
           if (fallback && !act().swarmRuns[fallback.runId]) {
             act().upsertSwarmStatus(fallback);
+            hydrateSwarmRunUsage(fallback.runId);
           }
         }
       },
@@ -852,6 +951,7 @@ export function Agent() {
 
       "attempt.completed": async (d) => {
         touch();
+        setGroundingRevision(null);
         const attemptId = String(d.attempt_id || "");
         markBackgroundCompletion(sid, attemptId);
         if (act().sessionId !== sid) {
@@ -870,14 +970,39 @@ export function Agent() {
         }
         const streamedAnswer = act().streamingText + pendingTextRef.current;
         flushPendingStreamUpdate();
+        // No live activity means we never saw this attempt run (connected after
+        // the fact); rebuild its timing from the event rather than from now.
+        const eventStartedSec = Number(d.started_at);
+        const eventElapsedMs = Number(d.elapsed_ms);
+        const eventEndedSec = Number(d.ended_at);
+        const completedEndedAt = Number.isFinite(eventEndedSec) && eventEndedSec > 0
+          ? eventEndedSec * 1000
+          : Date.now();
+        const completedStartedAt = Number.isFinite(eventStartedSec) && eventStartedSec > 0
+          ? eventStartedSec * 1000
+          : Number.isFinite(eventElapsedMs) && eventElapsedMs > 0
+            ? completedEndedAt - eventElapsedMs
+            : undefined;
         if (!act().activity) {
-          act().startActivity(attemptId || `completed-${Date.now()}`);
+          act().startActivity(attemptId || `completed-${Date.now()}`, completedStartedAt);
         } else if (attemptId && act().activity?.attemptId !== attemptId) {
           act().setActivityAttemptId(attemptId);
         }
+        // A client that joined mid-attempt may have started its clock late; the
+        // backend's start is authoritative for the durable row.
+        const liveStart = act().activity?.startedAt;
+        if (
+          completedStartedAt !== undefined
+          && liveStart !== undefined
+          && completedStartedAt < liveStart
+        ) {
+          useAgentStore.setState((state) => ({
+            activity: state.activity ? { ...state.activity, startedAt: completedStartedAt } : null,
+          }));
+        }
         const s = act();
         const completedTools = s.activity?.steps ?? s.toolCalls;
-        const completedActivity = archiveActivity("done");
+        const completedActivity = archiveActivity("done", completedEndedAt);
         const completedAttemptId = completedActivity?.attemptId || attemptId;
         useAgentStore.setState((state) => ({
           messages: state.messages.filter(
@@ -935,24 +1060,12 @@ export function Agent() {
 
         // Show RunCompleteCard when the turn produced backtest metrics or a shadow report
         if (runId) {
-          let runMetrics: Record<string, number> | undefined;
-          let runCurve: Array<{ time: string; equity: number }> | undefined;
-          let showCard = false;
-          try {
-            const runData = await api.getRun(runId);
-            if (isReportWorthyRun(runData)) {
-              runMetrics = runData.metrics;
-              runCurve = runData.equity_curve?.map(e => ({ time: e.time, equity: Number(e.equity) }));
-              showCard = true;
-            }
-          } catch {
-            showCard = true; // fetch failed → show link as fallback
-          }
-          if (showCard || shadowId) {
+          const card = runCardFields(await api.getRunPreview(runId).catch(() => null));
+          if (card || shadowId) {
             s.addMessage({
               id: "", type: "run_complete", content: "", runId,
-              metrics: showCard ? runMetrics : undefined,
-              equityCurve: showCard ? runCurve : undefined,
+              metrics: card?.metrics,
+              equityCurve: card?.equityCurve,
               shadowId,
               timestamp: Date.now(),
             });
@@ -966,6 +1079,7 @@ export function Agent() {
 
       "attempt.failed": (d) => {
         touch();
+        setGroundingRevision(null);
         const attemptId = String(d.attempt_id || "");
         if (act().sessionId !== sid) {
           act().clearStreamingSession(sid);
@@ -1007,6 +1121,7 @@ export function Agent() {
       // to avoid showing an error bubble.
       "attempt.cancelled": (d) => {
         touch();
+        setGroundingRevision(null);
         const attemptId = String(d.attempt_id || "");
         if (act().sessionId !== sid) {
           act().clearStreamingSession(sid);
@@ -1177,6 +1292,7 @@ export function Agent() {
     loadGoalSnapshot,
     markBackgroundCompletion,
     queueStreamUpdate,
+    recordLlmUsage,
     scrollToBottom,
   ]);
 
@@ -1188,6 +1304,7 @@ export function Agent() {
       genRef.current = gen;
       doDisconnect();
       setRuntimeIdentity({});
+      setGroundingRevision(null);
       // Live-channel timeline items are per-session; clear on switch.
       setLiveItems([]);
       liveRuntimeRef.current?.resetSession();
@@ -1197,7 +1314,7 @@ export function Agent() {
       const cached = getCachedSession(urlSessionId);
       switchSession(urlSessionId, cached);
       if (cached) {
-        setTimeout(() => forceScrollToBottom(), 50);
+        scheduleHistoryScroll();
       }
       // Cached rows provide an instant shell; REST remains authoritative for a
       // turn that completed while this session was off-screen.
@@ -1215,20 +1332,40 @@ export function Agent() {
       const gen = genRef.current + 1;
       genRef.current = gen;
       setRuntimeIdentity({});
+      setGroundingRevision(null);
       const seed = curMsgs.length > 0 ? curMsgs : getCachedSession(urlSessionId);
+      // switchSession() drops the live activity so replay can rebuild its
+      // steps without duplicating them — but the attempt's start time is not
+      // something replay can restore once the ring buffer has rotated past
+      // `attempt.started`. Re-seed the still-running activity with its
+      // original startedAt so the elapsed clock does not restart at 0s.
+      const liveActivity = act().activity;
       switchSession(urlSessionId, seed);
+      if (liveActivity && liveActivity.endedAt === undefined) {
+        const store = act();
+        store.startActivity(liveActivity.attemptId, liveActivity.startedAt);
+        store.setActivityState(liveActivity.state);
+      }
       loadSessionMessages(urlSessionId, gen);
       setupSSE(urlSessionId);
     } else if (!urlSessionId && curSid) {
       genRef.current += 1;
       doDisconnect();
       setRuntimeIdentity({});
+      setGroundingRevision(null);
+      setHistoryError(null);
       setLiveItems([]);
       liveRuntimeRef.current?.resetSession();
       if (curSid && curMsgs.length > 0) cacheSession(curSid, curMsgs);
       reset();
     }
-  }, [urlSessionId, doDisconnect, loadSessionMessages, setupSSE, forceScrollToBottom]);
+  }, [urlSessionId, doDisconnect, loadSessionMessages, setupSSE, scheduleHistoryScroll]);
+
+  /* The live token counter belongs to one session; zero it on a real switch,
+     not on callback-identity churn of the rehydration effect above. */
+  useEffect(() => {
+    resetLlmUsage();
+  }, [sessionId, resetLlmUsage]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -1243,6 +1380,8 @@ export function Agent() {
   }, [sessionId, loadGoalSnapshot]);
 
   useEffect(() => () => {
+    // Invalidate pending history loads before they can schedule another scroll.
+    genRef.current += 1;
     doDisconnect();
     cancelAnimationFrame(progressRafRef.current);
     pendingProgressRef.current.clear();
@@ -1301,6 +1440,13 @@ export function Agent() {
     attachments: ComposerAttachment[] = [],
   ) => {
     if ((!prompt.trim() && attachments.length === 0) || status === "streaming") return;
+    const finalPrompt = buildChatPrompt(prompt, attachments, Boolean(swarmPreset));
+    const limit = goalComposerActive ? MAX_GOAL_CHARS : MAX_MESSAGE_CHARS;
+    if (promptExceedsLimit(goalComposerActive ? prompt : finalPrompt, limit)) {
+      toast.error(t('agent.messageTooLong', { limit: limit.toLocaleString() }));
+      composerRef.current?.fill(prompt);
+      return;
+    }
     clearStreamingView();
 
     if (goalComposerActive) {
@@ -1338,7 +1484,6 @@ export function Agent() {
       return;
     }
 
-    let finalPrompt = prompt;
     const displayPrompt = toDisplayPrompt(prompt);
     const messageMeta: AgentMessageMeta = { ...displayPrompt.meta };
 
@@ -1346,12 +1491,10 @@ export function Agent() {
     if (swarmPreset) {
       messageMeta.swarmMode = true;
       setSwarmPreset(null);
-      finalPrompt = `${SWARM_PROMPT_PREFIX}${prompt}`;
     }
 
     if (attachments.length > 0) {
       messageMeta.attachments = attachments.map(({ filename }) => ({ filename }));
-      finalPrompt = prependUploadedAttachments(finalPrompt, attachments);
     }
     messageMeta.requestText = finalPrompt;
     act().addMessage({
@@ -1384,7 +1527,8 @@ export function Agent() {
     } catch (error) {
       archiveActivity("failed");
       act().setStatus("error");
-      const message = isAuthRequiredError(error) ? AUTH_REQUIRED_MESSAGE : t('agent.failedToSend');
+      const message = isAuthRequiredError(error) ? AUTH_REQUIRED_MESSAGE
+        : error instanceof ApiError && ['message_too_long', 'network_error', 'request_timeout'].includes(error.code || '') ? error.message : t('agent.failedToSend');
       toast.error(message);
       act().addMessage({ id: "", type: "error", content: message, timestamp: Date.now() });
     }
@@ -1418,6 +1562,20 @@ export function Agent() {
     }
     try {
       await api.cancelSession(sessionId);
+      // Cancelling the session only stops the ReAct loop; a swarm tool call that
+      // already returned keeps its workers running. Tell the swarm endpoint too
+      // and settle the cards locally, so the user sees "cancelled" immediately
+      // instead of a card that stays "running" until the last worker notices.
+      const activeSwarmRuns = Object.values(swarmRuns).filter(
+        (run) => run.status === "pending" || run.status === "running",
+      );
+      for (const run of activeSwarmRuns) {
+        act().updateSwarmStatus(run.runId, stopSwarmRun);
+        void api.cancelSwarmRun(run.runId).catch(() => {
+          // Already finished or unknown to this runtime — the local status is
+          // what the card shows either way.
+        });
+      }
       flushPendingStreamUpdate();
       const partialAnswer = act().streamingText;
       const stoppedActivity = archiveActivity("stopped");
@@ -1435,6 +1593,7 @@ export function Agent() {
     flushPendingStreamUpdate,
     persistPartialAnswer,
     sessionId,
+    swarmRuns,
     t,
   ]);
 
@@ -1644,6 +1803,14 @@ export function Agent() {
     });
   }, [timelineRows.length]);
 
+  const groundingRound = (
+    status === "streaming"
+    && groundingRevision
+    && activity?.attemptId === groundingRevision.attemptId
+  )
+    ? groundingRevision.round
+    : null;
+
   return (
     <div className="flex flex-col flex-1 min-w-0 overflow-hidden h-full">
       <ModelRuntimeBar
@@ -1652,6 +1819,16 @@ export function Agent() {
         runtimeModel={visibleRuntimeIdentity.model}
         runtimeReasoningEffort={visibleRuntimeIdentity.reasoningEffort}
       />
+      {historyError && (
+        <div role="alert" className="flex flex-wrap items-center gap-2 border-b border-warning/30 bg-warning/10 px-4 py-2 text-xs">
+          <span>{t("layout.sessionsLoadFailed")} {historyError}</span>
+          <button type="button" onClick={() => {
+            if (!sessionId) return;
+            act().setSessionLoading(true);
+            void refreshSessionMessages(sessionId);
+          }} className="ms-auto rounded-md border px-2 py-1">{t("connection.retry")}</button>
+        </div>
+      )}
       <div
         ref={listRef}
         data-streaming={status === "streaming" ? "true" : undefined}
@@ -1676,7 +1853,7 @@ export function Agent() {
               ))}
             </div>
           )}
-          {!sessionLoading && messages.length === 0 && (
+          {!sessionLoading && !historyError && messages.length === 0 && (
             // my-auto (not justify-*) centers the hero vertically while staying
             // scroll-reachable once the example library expands past the viewport.
             <div className="msg-enter my-auto">
@@ -1774,6 +1951,17 @@ export function Agent() {
               <AgentAvatar />
               <div className="flex-1 min-w-0 space-y-2">
                 {activity && <ActivityLine activity={activity} reasoningTail={reasoningTail} />}
+                <LlmUsageCounter input={usageInput} output={usageOutput} />
+                {groundingRound !== null && (
+                  <p
+                    role="status"
+                    aria-live="polite"
+                    className="flex items-center gap-2 px-3 text-xs text-muted-foreground"
+                  >
+                    <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-muted-foreground/80" aria-hidden="true" />
+                    <span>{t("agent.activity.checkingFigures", { round: groundingRound })}</span>
+                  </p>
+                )}
                 {streamingText && (
                   <div aria-live="polite" aria-atomic="false">
                     <MarkdownContent content={streamingText} streaming showCursor />

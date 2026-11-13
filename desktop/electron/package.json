@@ -19,14 +19,22 @@
     "smoke:credentials": "npm run build && npm run prepare:electron && electron scripts/smoke-credentials.cjs",
     "smoke:lifecycle": "npm run build && npm run prepare:electron && node scripts/test-packaging-preparation.mjs && node scripts/test-locales.mjs && node scripts/test-backend-resolution.mjs && node scripts/smoke-lifecycle.mjs && node scripts/smoke-parent-death.mjs",
     "pack:win": "npm run build && npm run prepare:electron && electron-builder --publish never --win dir",
-    "installer:win:review": "npm run build && npm run prepare:electron && node scripts/build-review-installer.mjs",
+    "installer:win:review": "npm run runtime:win -- -Clean && npm run build && npm run prepare:electron && node scripts/build-review-installer.mjs",
     "installer:win:signed": "node scripts/build-signed-installer.mjs",
     "sbom": "npm sbom --sbom-format cyclonedx"
+  },
+  "overrides": {
+    "brace-expansion@^1.0.0": "^1.1.21",
+    "brace-expansion@^2.0.0": "^2.1.7",
+    "brace-expansion@^5.0.0": "^5.0.12",
+    "fast-uri@^3.0.0": "^3.1.9",
+    "undici@^6.0.0": "^6.29.1",
+    "undici@^7.0.0": "^7.30.1"
   },
   "devDependencies": {
     "@electron-internal/extract-zip": "1.0.4",
     "@types/node": "^24.10.0",
-    "electron": "43.1.1",
+    "electron": "43.8.4",
     "electron-builder": "26.15.3",
     "typescript": "^5.9.3"
   },
@@ -48,6 +56,7 @@
     "directories": {
       "output": "release"
     },
+    "publish": null,
     "files": [
       "dist/**/*",
       "package.json"

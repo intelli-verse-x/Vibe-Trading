@@ -42,7 +42,7 @@ _EM_NEWS_URL = "https://search-api-web.eastmoney.com/search/jsonp"
 # A-share / China-market suffixes that route to the Eastmoney news surface.
 _EM_SUFFIXES = ("SH", "SZ", "BJ")
 # Suffixes that route to Yahoo's search-news surface.
-_YAHOO_SUFFIXES = ("US", "HK")
+_YAHOO_SUFFIXES = ("US", "HK", "SA")
 
 # Default broad-market query used when ``scope='global'`` carries no code.
 _GLOBAL_QUERY = "财经"
@@ -161,7 +161,8 @@ def _fetch_eastmoney_news(query: str, limit: int) -> list[dict[str, Any]]:
     Raises:
         requests.RequestException: Network failure, propagated to the caller.
         requests.HTTPError: Non-2xx response status.
-        ValueError: Body is not valid JSON.
+        ValueError: Body is not valid JSON, or Eastmoney answered with its
+            degraded user index instead of the CMS article index.
     """
     param = json.dumps(
         {
@@ -181,9 +182,10 @@ def _fetch_eastmoney_news(query: str, limit: int) -> list[dict[str, Any]]:
         },
         ensure_ascii=False,
     )
+    params = {"cb": "", "param": param, "_": "0"}
     payload = eastmoney_client.get_json(
         _EM_NEWS_URL,
-        params={"cb": "", "param": param, "_": "0"},
+        params=params,
     )
     decoded = _decode_jsonp(payload)
     if not isinstance(decoded, dict):
@@ -193,6 +195,23 @@ def _fetch_eastmoney_news(query: str, limit: int) -> list[dict[str, Any]]:
         return []
     articles = result.get("cmsArticleWebOld")
     if not isinstance(articles, list):
+        # Eastmoney swaps the CMS article index for its Guba user index
+        # ("passportWeb") when it distrusts the caller, so a degraded answer is
+        # shaped like a valid but empty one. Reading it as ``[]`` would turn a
+        # blocked upstream into a silent "no news for this stock" (#2081).
+        if result:
+            # Retry once with a browser TLS fingerprint, through the SAME
+            # provider throttle. A genuine empty CMS list never reaches here.
+            retry = eastmoney_client.get_json(_EM_NEWS_URL, params=params, browser=True)
+            retry = _decode_jsonp(retry)
+            result = retry.get("result", {}) if isinstance(retry, dict) else {}
+            if isinstance(result, dict) and isinstance(result.get("cmsArticleWebOld"), list):
+                return [_em_article(a) for a in result["cmsArticleWebOld"] if isinstance(a, dict)][:limit]
+            raise ValueError(
+                "eastmoney returned no cmsArticleWebOld section "
+                f"(result keys: {sorted(result) if isinstance(result, dict) else []}):"
+                " the search index remained degraded after the browser TLS retry"
+            )
         return []
     return [_em_article(a) for a in articles if isinstance(a, dict)][:limit]
 
@@ -249,8 +268,9 @@ class StockNewsTool(BaseTool):
     description = (
         "Fetch recent financial news headlines, read-only and no auth. Markets: "
         "China A-share (SH/SZ/BJ) returns Eastmoney news ARTICLES "
-        "(title/url/source/published/snippet) under 'articles'. US (.US) and Hong "
-        "Kong (.HK) return Yahoo Finance news articles with the same fields. Use "
+        "(title/url/source/published/snippet) under 'articles'. US (.US), Hong "
+        "Kong (.HK) and Brazil (B3 .SA) return Yahoo Finance news articles with "
+        "the same fields. Use "
         "scope 'stock' with a 'code', or scope 'global' (no code) for broad "
         "China-market finance articles. "
         'Example: {"code": "600519.SH", "scope": "stock", "limit": 10}.'
@@ -353,6 +373,10 @@ class StockNewsTool(BaseTool):
         if suffix in _EM_SUFFIXES:
             return self._stock_via_eastmoney(code, query, limit)
         if suffix in _YAHOO_SUFFIXES:
+            # A bare B3 code (PETR4) is ambiguous on Yahoo search; its own
+            # spelling (PETR4.SA) is the listing.
+            if suffix == "SA":
+                query = code.upper()
             return self._stock_via_yahoo(code, query, limit)
         return self._error(
             f"unsupported market for code {code!r}; expected suffix in "
@@ -374,7 +398,7 @@ class StockNewsTool(BaseTool):
 
     def _stock_via_yahoo(self, code: str, query: str, limit: int) -> str:
         """Fetch US/HK news articles from Yahoo for one code."""
-        market = "hk" if _suffix_of(code) == "HK" else "us"
+        market = {"HK": "hk", "SA": "br"}.get(_suffix_of(code), "us")
         try:
             articles = _fetch_yahoo_news(query, limit)
         except Exception as exc:  # noqa: BLE001 - surface any fetch failure as envelope

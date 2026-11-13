@@ -37,6 +37,7 @@ class _ContentFilterLoopLLM:
         timeout: int | None = None,
         idle_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        on_waiting_chunk=None,
     ) -> LLMResponse:
         self.calls += 1
         self.messages_history.append(list(messages))
@@ -69,6 +70,7 @@ class _EmptyResponseLoopLLM:
         timeout: int | None = None,
         idle_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        on_waiting_chunk=None,
     ) -> LLMResponse:
         self.calls += 1
         return LLMResponse(content="", content_filter_triggered=False)
@@ -213,6 +215,7 @@ def test_single_empty_response_recovers_with_nudge(
             timeout: int | None = None,
             idle_timeout_s: float | None = None,
             should_cancel: Callable[[], bool] | None = None,
+            on_waiting_chunk=None,
         ) -> LLMResponse:
             self.calls += 1
             self.messages_history.append(list(messages))
@@ -231,12 +234,18 @@ def test_single_empty_response_recovers_with_nudge(
     assert result["status"] == "success"
     assert result["content"] == "Finally."
     assert llm.calls == 2
-    system_msgs = [
+    nudge_msgs = [
         m for m in llm.messages_history[1]
-        if "[SYSTEM]" in str(m.get("content", ""))
+        if "<system>" in str(m.get("content", ""))
         and "empty" in str(m.get("content", "")).casefold()
     ]
-    assert len(system_msgs) == 1
+    assert len(nudge_msgs) == 1
+    # Regression for #2115: the mid-run nudge must not use the system role.
+    # langchain-anthropic rejects a second, non-leading system message with
+    # "Received multiple non-consecutive system messages", so a transient
+    # empty reply must retry through a user message, matching the steering
+    # messages moved in #1109/#1112.
+    assert nudge_msgs[0].get("role") == "user"
 
 def test_auto_compact_summary_hard_deadline(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -251,7 +260,7 @@ def test_auto_compact_summary_hard_deadline(
     """
     import time
 
-    import src.agent.loop as loop_module
+    import src.agent.tuning as tuning_module
     from src.agent.loop import AgentLoop
     from src.agent.tools import ToolRegistry
     from src.agent.trace import TraceWriter
@@ -270,7 +279,7 @@ def test_auto_compact_summary_hard_deadline(
 
     llm = _HangingSummaryLLM()
     agent = AgentLoop(registry=ToolRegistry(), llm=llm)
-    monkeypatch.setattr(loop_module, "LLM_TIMEOUT_SECONDS", 0.3, raising=False)
+    monkeypatch.setattr(tuning_module, "LLM_TIMEOUT_SECONDS", 0.3, raising=False)
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": "sys"},
@@ -322,6 +331,7 @@ class _RatioFilterLoopLLM:
         timeout: int | None = None,
         idle_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        on_waiting_chunk=None,
     ) -> LLMResponse:
         self.calls += 1
         if self.calls <= self._filter_count:

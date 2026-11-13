@@ -6,16 +6,12 @@
     "base_url_env": "OPENROUTER_BASE_URL",
     "default_model": "deepseek/deepseek-v4-pro",
     "default_base_url": "https://openrouter.ai/api/v1",
-    "api_key_required": true
-  },
-  {
-    "name": "requesty",
-    "label": "Requesty",
-    "api_key_env": "REQUESTY_API_KEY",
-    "base_url_env": "REQUESTY_BASE_URL",
-    "default_model": "openai/gpt-4o-mini",
-    "default_base_url": "https://router.requesty.ai/v1",
-    "api_key_required": true
+    "api_key_required": true,
+    "model_options": [
+      "minimax/minimax-m3.1-flash:free",
+      "minimax/minimax-m3.1-flash",
+      "minimax/minimax-m3"
+    ]
   },
   {
     "name": "openai",
@@ -40,11 +36,22 @@
     "label": "OpenAI Codex (ChatGPT OAuth)",
     "api_key_env": null,
     "base_url_env": "OPENAI_CODEX_BASE_URL",
-    "default_model": "openai-codex/gpt-5.4",
+    "default_model": "openai-codex/gpt-6-sol",
     "default_base_url": "https://chatgpt.com/backend-api/codex/responses",
     "api_key_required": false,
     "auth_type": "oauth",
-    "login_command": "vibe-trading provider login openai-codex"
+    "login_command": "vibe-trading provider login openai-codex",
+    "reasoning_efforts": [
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra",
+      "persistent"
+    ]
   },
   {
     "name": "deepseek",
@@ -54,6 +61,24 @@
     "default_model": "deepseek-v4-pro",
     "default_base_url": "https://api.deepseek.com/v1",
     "api_key_required": true
+  },
+  {
+    "name": "opencode",
+    "label": "OpenCode (Go / Zen)",
+    "api_key_env": "OPENCODE_API_KEY",
+    "base_url_env": "OPENCODE_BASE_URL",
+    "default_model": "deepseek-v4.1-flash",
+    "default_base_url": "https://opencode.ai/zen/go/v1",
+    "base_url_options": [
+      "https://opencode.ai/zen/go/v1",
+      "https://opencode.ai/zen/v1"
+    ],
+    "api_key_required": true,
+    "model_options": [
+      "minimax-m3.1-flash-free",
+      "minimax-m3.1-flash",
+      "minimax-m3"
+    ]
   },
   {
     "name": "siliconflow-cn",
@@ -168,7 +193,11 @@
     "label": "MiniMax",
     "api_key_env": "MINIMAX_API_KEY",
     "base_url_env": "MINIMAX_BASE_URL",
-    "default_model": "MiniMax-M3",
+    "default_model": "MiniMax-M3.1-Flash",
+    "model_options": [
+      "MiniMax-M3.1-Flash",
+      "MiniMax-M3"
+    ],
     "default_base_url": "https://api.minimax.io/v1",
     "base_url_options": [
       "https://api.minimax.io/v1",
@@ -231,5 +260,23 @@
     "api_key_required": false,
     "auth_type": "gh_cli",
     "login_command": "gh auth login"
+  },
+  {
+    "name": "claude-cli",
+    "label": "Claude Code CLI (local login)",
+    "api_key_env": null,
+    "base_url_env": "CLAUDE_CLI_BASE_URL",
+    "default_model": "claude-opus-5-5",
+    "default_base_url": "",
+    "api_key_required": false,
+    "auth_type": "claude_cli",
+    "login_command": "claude auth login",
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ]
   }
 ]

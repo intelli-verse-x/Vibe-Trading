@@ -296,17 +296,23 @@ def test_ibkr_oauth_registration_uses_browser_headers(tmp_path) -> None:
                 },
                 request=request,
             )
+        # Mirrors IBKR's live documents, fetched 2026-10-21: the protected
+        # resource names https://api.ibkr.com, the issuer every well-known
+        # path reports (until 2026-09 it named https://api.ibkr.com/oauth2,
+        # which mcp>=1.30's RFC 8414 issuer check refuses).
         if url == f"{cfg.url}/.well-known/oauth-protected-resource":
             return httpx.Response(
                 200,
                 json={
                     "resource": cfg.url,
-                    "authorization_servers": ["https://api.ibkr.com/oauth2"],
-                    "scopes_supported": ["mcp.read"],
+                    "authorization_servers": ["https://api.ibkr.com"],
+                    "scopes_supported": ["mcp.read", "mcp.write", "mcp.orders.submit"],
+                    "bearer_methods_supported": ["header"],
                 },
                 request=request,
             )
         if url in {
+            "https://api.ibkr.com/.well-known/oauth-authorization-server",
             "https://api.ibkr.com/.well-known/oauth-authorization-server/oauth2",
             "https://api.ibkr.com/oauth2/.well-known/oauth-authorization-server",
         }:
@@ -506,3 +512,30 @@ def test_stdio_path_unchanged() -> None:
     cfg = MCPServerConfig.model_validate({"command": "uvx", "args": ["demo"]})
     transport = _build_transport(cfg)
     assert isinstance(transport, StdioTransport)
+
+
+def test_mcp_floor_includes_the_session_reclamation_fix() -> None:
+    """``--transport http`` needs mcp>=1.30 (CVE-2026-59951).
+
+    Before 1.30 a stateful Streamable HTTP server never reclaimed sessions:
+    no expiry, a DELETEd session stayed registered and there was no cap, so
+    ordinary short requests grew server memory without bound. 0.1.15-0.1.17
+    capped mcp below 1.30 because 1.30's RFC 8414 issuer check refused IBKR's
+    metadata; IBKR's protected-resource document now names the same issuer
+    (fixture above), so the requirement is a floor again.
+    """
+    import tomllib
+    from pathlib import Path
+
+    from packaging.requirements import Requirement
+
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    dependencies = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+        "dependencies"
+    ]
+    pins = [Requirement(entry) for entry in dependencies if Requirement(entry).name == "mcp"]
+    assert pins, "the mcp requirement is gone from pyproject dependencies"
+    assert not pins[0].specifier.contains("1.29.1"), (
+        f"{pins[0]} admits mcp 1.29.1, which never reclaims HTTP sessions"
+    )
+    assert pins[0].specifier.contains("1.30.0"), f"{pins[0]} excludes the fixed release"

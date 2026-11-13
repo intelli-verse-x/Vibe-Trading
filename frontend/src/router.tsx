@@ -22,6 +22,11 @@ const Scheduled = lazy(() =>
 const Reports = lazy(() =>
   import("@/pages/Reports").then((m) => ({ default: m.Reports })),
 );
+const ResearchArtifacts = lazy(() =>
+  import("@/pages/ResearchArtifacts").then((m) => ({ default: m.ResearchArtifacts })),
+);
+const ResearchLab = lazy(() => import("@/pages/ResearchLab").then((m) => ({ default: m.ResearchLab })));
+const PaperTrading = lazy(() => import("@/pages/PaperTrading").then((m) => ({ default: m.PaperTrading })));
 const Portfolio = lazy(() =>
   import("@/pages/Portfolio").then((m) => ({ default: m.Portfolio })),
 );
@@ -33,6 +38,9 @@ const AlphaZoo = lazy(() =>
 );
 const OptionsLab = lazy(() =>
   import("@/pages/OptionsLab").then((m) => ({ default: m.OptionsLab })),
+);
+const PixelOffice = lazy(() =>
+  import("@/pages/PixelOffice").then((m) => ({ default: m.PixelOffice })),
 );
 
 function PageLoader() {
@@ -58,9 +66,13 @@ export const router = createBrowserRouter([
       { path: "/", element: wrap(Agent) },
       { path: "/about", element: wrap(Home) },
       { path: "/agent", element: wrap(Agent) },
+      { path: "/pixel-office", element: wrap(PixelOffice) },
       { path: "/runtime", element: wrap(Runtime) },
       { path: "/scheduled", element: wrap(Scheduled) },
       { path: "/reports", element: wrap(Reports) },
+      { path: "/research-artifacts", element: wrap(ResearchArtifacts) },
+      { path: "/research-lab", element: wrap(ResearchLab) },
+      { path: "/paper-trading", element: wrap(PaperTrading) },
       { path: "/portfolio", element: wrap(Portfolio) },
       { path: "/settings", element: wrap(Settings) },
       { path: "/runs/:runId", element: wrap(RunDetail) },

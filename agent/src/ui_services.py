@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import json
 from datetime import datetime, timedelta
+from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -62,11 +63,12 @@ def load_json_file(path: Path) -> Optional[Dict[str, Any]]:
     return None
 
 
-def load_csv_records(path: Path) -> List[Dict[str, Any]]:
+def load_csv_records(path: Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """Load CSV rows as dictionaries.
 
     Args:
         path: CSV file path.
+        limit: Stop after this many rows; ``None`` reads the whole file.
 
     Returns:
         Parsed CSV rows. Missing or unreadable files return an empty list.
@@ -76,7 +78,7 @@ def load_csv_records(path: Path) -> List[Dict[str, Any]]:
 
     try:
         with path.open("r", encoding="utf-8", newline="") as handle:
-            return [dict(row) for row in csv.DictReader(handle)]
+            return [dict(row) for row in islice(csv.DictReader(handle), limit)]
     except Exception:
         return []
 
@@ -628,10 +630,10 @@ def _flatten_data_map(data_map: Dict[str, Any], start_date: str) -> List[Dict[st
                     "time": pd.Timestamp(timestamp).strftime("%Y-%m-%d"),
                     "timestamp": pd.Timestamp(timestamp).strftime("%Y-%m-%d"),
                     "code": code,
-                    "open": round(float(row.get("open") or 0.0), 6),
-                    "high": round(float(row.get("high") or 0.0), 6),
-                    "low": round(float(row.get("low") or 0.0), 6),
-                    "close": round(float(row.get("close") or 0.0), 6),
+                    "open": float(row.get("open") or 0.0),
+                    "high": float(row.get("high") or 0.0),
+                    "low": float(row.get("low") or 0.0),
+                    "close": float(row.get("close") or 0.0),
                     "volume": round(float(row.get("volume") or 0.0), 6),
                 }
             )

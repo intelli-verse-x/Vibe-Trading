@@ -39,13 +39,13 @@ ALPHA_ID = "gtja191_184"
 __alpha_meta__ = {
     'id': 'gtja191_184',
     'theme': ['reversal'],
-    'formula_latex': 'see body',
+    'formula_latex': '(RANK(CORR(DELAY((OPEN - CLOSE), 1), CLOSE, 200)) + RANK((OPEN - CLOSE)))',
     'columns_required': ['open', 'close'],
     'extras_required': [],
     'universe': ['equity_cn'],
     'frequency': ['1d'],
     'decay_horizon': 60,
-    'min_warmup_bars': 202,
+    'min_warmup_bars': 201,
     'notes': '',
 }
 

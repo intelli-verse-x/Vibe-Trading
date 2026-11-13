@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import numpy as np
 import pandas as pd
@@ -41,10 +42,11 @@ def test_weights_are_renormalized_with_warning():
     _assert_strict_json(result)
 
 
-def test_negative_weight_rejected():
+def test_negative_weight_is_part_of_the_book():
     closes = _closes({"AAA": list(range(100, 160)), "BBB": list(range(50, 110))})
-    with pytest.raises(ValueError, match="long-only"):
-        compute_risk_xray(closes, {"AAA": 1.5, "BBB": -0.5})
+    result = compute_risk_xray(closes, {"AAA": 1.5, "BBB": -0.5}, min_history=10)
+    assert result["exposure"]["short_count"] == 1
+    assert result["exposure"]["gross"] == pytest.approx(2.0)
 
 
 def test_unknown_symbol_rejected():
@@ -299,16 +301,17 @@ def test_average_invested_weights_rejects_flat_strategy():
         average_invested_weights(pd.DataFrame())
 
 
-def test_average_invested_weights_rejects_long_short_book():
-    # A net-short leg must refuse the x-ray outright, not silently shrink the
-    # basket to the long half and present it as the whole strategy.
+def test_average_invested_weights_carries_short_leg():
+    # Keep the short leg in the average book instead of refusing the x-ray or
+    # silently shrinking the report to the long half.
     idx = pd.date_range("2026-01-01", periods=4, freq="D")
     target_pos = pd.DataFrame(
         {"AAA": [0.5, 0.5, 0.5, 0.5], "BBB": [-0.25, -0.25, -0.25, -0.25]},
         index=idx,
     )
-    with pytest.raises(ValueError, match="long-only .* BBB"):
-        average_invested_weights(target_pos)
+    weights, avg_invested = average_invested_weights(target_pos)
+    assert weights == {"AAA": pytest.approx(0.5), "BBB": pytest.approx(-0.25)}
+    assert avg_invested == pytest.approx(0.25)
 
 
 def test_write_risk_xray_strict_json_and_markdown(tmp_path):
@@ -328,7 +331,8 @@ def test_write_risk_xray_strict_json_and_markdown(tmp_path):
     assert "annualized vol" in md
 
 
-def test_run_backtest_emits_risk_xray_artifacts(tmp_path):
+@pytest.mark.parametrize("bbb_signal", [1.0, -1.0])
+def test_run_backtest_emits_risk_xray_artifacts(tmp_path, bbb_signal):
     from backtest.engines.base import BaseEngine
 
     class _FlatEngine(BaseEngine):
@@ -362,7 +366,7 @@ def test_run_backtest_emits_risk_xray_artifacts(tmp_path):
 
     class _Signals:
         def generate(self, data):
-            return {code: pd.Series(1.0, index=frame.index) for code, frame in data.items()}
+            return {code: pd.Series(bbb_signal if code == "BBB" else 1.0, index=frame.index) for code, frame in data.items()}
 
     engine = _FlatEngine({"initial_cash": 100_000.0})
     metrics = engine.run_backtest(
@@ -374,9 +378,23 @@ def test_run_backtest_emits_risk_xray_artifacts(tmp_path):
 
     out_json = tmp_path / "artifacts" / "risk_xray.json"
     out_md = tmp_path / "artifacts" / "risk_xray.md"
+    warnings = json.loads((tmp_path / "run_card.json").read_text())["warnings"]
+    assert not any("Risk x-ray unavailable" in w for w in warnings)
     assert out_json.exists() and out_md.exists()
     payload = json.loads(out_json.read_text(encoding="utf-8"))
     _assert_strict_json(payload)
+    if bbb_signal < 0:
+        positions = pd.read_csv(tmp_path / "artifacts" / "positions.csv", index_col=0)
+        means = positions.mean()
+        assert payload["inputs"]["weights"] == pytest.approx(means.to_dict(), abs=1e-8)
+        assert payload["exposure"]["gross"] == pytest.approx(means.abs().sum())
+        assert payload["exposure"]["net"] == pytest.approx(means.sum())
+        assert payload["exposure"]["short_count"] == 1
+        returns = pd.DataFrame({code: frame["close"] for code, frame in data_map.items()}).pct_change().dropna()
+        expected_vol = (returns @ means).std(ddof=1) * math.sqrt(252)
+        assert metrics["risk_xray_annualized_vol"] == pytest.approx(expected_vol)
+        assert "short" in out_md.read_text()
+        return
     # The opening target is even, but actual weights drift with each symbol's
     # realized price path; the x-ray must reflect execution truth, not preserve
     # the optimizer's idealized 50/50 weights.
@@ -427,7 +445,7 @@ def test_periods_per_year_none_uses_calendar_day_annualization():
     bpy = int(len(port) / years)
     assert vol["annualized_vol"] == pytest.approx(port.std(ddof=1) * bpy**0.5)
     assert vol["downside_deviation_annualized"] == pytest.approx(
-        port[port < 0].std(ddof=1) * bpy**0.5
+        (port.clip(upper=0.0) ** 2).mean() ** 0.5 * bpy**0.5
     )
     _assert_strict_json(result)
 
@@ -489,3 +507,70 @@ def test_run_backtest_with_bars_per_year_none_does_not_crash(tmp_path):
         bars_per_year=None,
     )
     assert metrics["risk_xray_annualized_vol"] is not None
+
+
+def test_long_window_requests_full_history_without_sampling():
+    """Over the shared 250-row cap the fetch would sample the series down and
+    break consecutive-return math; the tool must ask for every row (#1461)."""
+    import math
+
+    n = 300
+    prices = [100.0 + i * 0.1 for i in range(n)]
+    idx = pd.date_range("2026-01-01", periods=n, freq="D")
+
+    def capped_fetch(*, codes, start_date, end_date, source, interval, max_rows=250, **kwargs):
+        rows = [{"date": str(idx[i].date()), "close": price} for i, price in enumerate(prices)]
+        if max_rows and len(rows) > max_rows:
+            step = math.ceil(len(rows) / max_rows)
+            rows = rows[::step]
+        return {codes[0]: rows, "_unresolved": []}
+
+    tool = PortfolioRiskXrayTool(data_fetcher=capped_fetch)
+    payload = json.loads(tool.execute(symbols=["AAA"], interval="1D"))
+
+    assert payload["status"] == "ok"
+    assert payload["data"]["inputs"]["aligned_days"] == n
+    assert payload["data"]["inputs"]["return_observations"] == n - 1
+    _assert_strict_json(payload)
+
+
+# ---------------------------------------------------------------------------
+# Downside deviation: zero-target RMS over every return period
+# ---------------------------------------------------------------------------
+
+
+def _closes_from_returns(returns: list[float]) -> pd.DataFrame:
+    idx = pd.date_range("2026-01-01", periods=len(returns) + 1, freq="D")
+    path = [100.0]
+    for value in returns:
+        path.append(path[-1] * (1.0 + value))
+    series = pd.Series(path, index=idx)
+    return pd.DataFrame({"AAA": series, "BBB": series})
+
+
+def test_downside_deviation_counts_equal_losses():
+    # Every losing bar loses exactly 1%: the sample std of the losses is zero,
+    # but the downside risk is not. Per 3-bar cycle: (0.01**2 + 0.01**2) / 3.
+    returns = [-0.01, -0.01, 0.03] * 13
+    result = compute_risk_xray(
+        _closes_from_returns(returns), {"AAA": 0.5, "BBB": 0.5}, min_history=10
+    )
+    expected = math.sqrt(0.0002 / 3) * math.sqrt(252)
+    assert result["volatility"]["downside_deviation_annualized"] == pytest.approx(expected)
+    _assert_strict_json(result)
+
+
+def test_downside_deviation_defined_for_a_single_loss():
+    returns = [0.01] * 38 + [-0.02]
+    result = compute_risk_xray(
+        _closes_from_returns(returns), {"AAA": 0.5, "BBB": 0.5}, min_history=10
+    )
+    expected = math.sqrt(0.02**2 / 39) * math.sqrt(252)
+    assert result["volatility"]["downside_deviation_annualized"] == pytest.approx(expected)
+
+
+def test_downside_deviation_is_zero_without_losses():
+    result = compute_risk_xray(
+        _closes_from_returns([0.01] * 39), {"AAA": 0.5, "BBB": 0.5}, min_history=10
+    )
+    assert result["volatility"]["downside_deviation_annualized"] == 0.0

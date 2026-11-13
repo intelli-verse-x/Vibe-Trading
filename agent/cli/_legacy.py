@@ -435,7 +435,6 @@ def _provider_key_env(provider: str | None) -> str | None:
     """Return the credential environment variable for a provider."""
     return {
         "openrouter": "OPENROUTER_API_KEY",
-        "requesty": "REQUESTY_API_KEY",
         "openai": "OPENAI_API_KEY",
         "deepseek": "DEEPSEEK_API_KEY",
         "nvidia": "NVIDIA_API_KEY",
@@ -460,7 +459,6 @@ def _provider_base_env(provider: str | None) -> str | None:
     """Return the base URL environment variable for a provider."""
     return {
         "openrouter": "OPENROUTER_BASE_URL",
-        "requesty": "REQUESTY_BASE_URL",
         "openai": "OPENAI_BASE_URL",
         "openai-codex": "OPENAI_CODEX_BASE_URL",
         "deepseek": "DEEPSEEK_BASE_URL",
@@ -1247,6 +1245,16 @@ def _run_agent(
         else:
             console.print(f"[yellow]WARNING:[/yellow] {msg}")
 
+    # One owner for the whole CLI run: background results stay with the
+    # conversation that started them, and a bare run gets a private owner
+    # instead of a view shared with every other run in the process.
+    from src.tools.background_tools import BackgroundScope, get_background_manager
+
+    background_scope = BackgroundScope(
+        owner_id=f"session:{session_id}" if session_id else f"cli:{uuid.uuid4().hex}"
+    )
+    background = get_background_manager().for_scope(background_scope)
+
     agent = AgentLoop(
         registry=build_registry(
             persistent_memory=pm,
@@ -1254,11 +1262,14 @@ def _run_agent(
             agent_config=agent_config,
             session_id=session_id or None,
             warn_callback=_mcp_warn,
+            background_manager=background,
+            background_scope=background_scope,
         ),
         llm=ChatLLM(),
         event_callback=on_event,
         max_iterations=max_iter,
         persistent_memory=pm,
+        background_manager=background,
     )
     if run_dir_override:
         agent.memory.run_dir = run_dir_override
@@ -1904,6 +1915,9 @@ def _show_settings() -> None:
     runtime_table = Table.grid(expand=True)
     runtime_table.add_column(width=13, style="dim")
     runtime_table.add_column(ratio=1)
+    from src.config.gildata_features import selected_features
+
+    runtime_table.add_row("Gildata opt-ins", ", ".join(selected_features()) or "(none)")
     runtime_table.add_row("Temperature", str(_cfg.llm.langchain_temperature))
     runtime_table.add_row("Timeout", str(_cfg.llm.timeout_seconds) + "s")
     runtime_table.add_row("Retries", str(_cfg.llm.max_retries))
@@ -3010,9 +3024,11 @@ def cmd_provider_login(provider: str) -> int:
     normalized = provider.strip().lower().replace("_", "-")
     if normalized in {"copilot", "github-copilot"}:
         return _login_copilot()
+    if normalized == "claude-cli":
+        return _login_claude_cli()
     if normalized != "openai-codex":
         console.print(
-            "[red]Unknown OAuth provider.[/red] Supported: openai-codex, copilot"
+            "[red]Unknown OAuth provider.[/red] Supported: openai-codex, copilot, claude-cli"
         )
         return EXIT_USAGE_ERROR
     try:
@@ -3061,6 +3077,23 @@ def _login_copilot() -> int:
         "[yellow]No GitHub credential found.[/yellow]\n"
         "Run [bold]copilot[/bold] and sign in, run [bold]gh auth login[/bold], "
         "or set [bold]COPILOT_GITHUB_TOKEN[/bold]."
+    )
+    return EXIT_RUN_FAILED
+
+
+def _login_claude_cli() -> int:
+    """Report the local Claude Code CLI login used by the claude-cli provider."""
+    from src.providers.claude_cli import get_claude_cli_auth_status
+
+    logged_in, method = get_claude_cli_auth_status()
+    if logged_in:
+        console.print(f"[green]Claude Code CLI is logged in[/green]  [dim]{method}[/dim]")
+        return EXIT_SUCCESS
+
+    console.print(
+        f"[yellow]Claude Code CLI is not logged in[/yellow] ({method}).\n"
+        "Run [bold]claude auth login[/bold], or set [bold]CLAUDE_CLI_PATH[/bold] "
+        "to the claude executable."
     )
     return EXIT_RUN_FAILED
 
@@ -3321,113 +3354,16 @@ def _dispatch_channels(args: argparse.Namespace) -> int:
         return cmd_channels_login(args.channel_name, force=args.force)
     console.print("[red]channels requires a subcommand.[/red] Try: vibe-trading channels status")
     return EXIT_USAGE_ERROR
-# QVERIS-INTEGRATION
-def _print_qveris_config(config) -> None:  # QVERIS-INTEGRATION
-    """Render local QVeris config."""  # QVERIS-INTEGRATION
-    from src.tools.qveris_tool import SIGNUP_URL, INVITE_CODE, has_qveris_credentials, is_qveris_configured, mask_api_key, normalize_qveris_mode  # QVERIS-INTEGRATION
-    table = Table(title="Data Routing", box=box.SIMPLE)  # QVERIS-INTEGRATION
-    table.add_column("Field")  # QVERIS-INTEGRATION
-    table.add_column("Value")  # QVERIS-INTEGRATION
-    table.add_row("mode", normalize_qveris_mode(config.mode))  # QVERIS-INTEGRATION
-    table.add_row("free_route", "built-in public data")  # QVERIS-INTEGRATION
-    table.add_row("premium_provider", "QVeris")  # QVERIS-INTEGRATION
-    table.add_row("paid_active", "yes" if is_qveris_configured(config) else "no")  # QVERIS-INTEGRATION
-    table.add_row("premium_key", "yes" if has_qveris_credentials(config) else "no")  # QVERIS-INTEGRATION
-    table.add_row("base_url", config.base_url)  # QVERIS-INTEGRATION
-    table.add_row("api_key", mask_api_key(config.api_key) or "(not set)")  # QVERIS-INTEGRATION
-    table.add_row("budget/session", str(config.budget_credits_per_session))  # QVERIS-INTEGRATION
-    table.add_row("signup", SIGNUP_URL)  # QVERIS-INTEGRATION
-    table.add_row("invite_code", INVITE_CODE)  # QVERIS-INTEGRATION
-    console.print(table)  # QVERIS-INTEGRATION
-# QVERIS-INTEGRATION
-def cmd_qveris_status() -> int:  # QVERIS-INTEGRATION
-    """Show QVeris local config and live status when configured."""  # QVERIS-INTEGRATION
-    from src.tools.qveris_tool import QVerisClient, is_qveris_configured, load_qveris_config  # QVERIS-INTEGRATION
-    config = load_qveris_config()  # QVERIS-INTEGRATION
-    _print_qveris_config(config)  # QVERIS-INTEGRATION
-    if not is_qveris_configured(config):  # QVERIS-INTEGRATION
-        return EXIT_SUCCESS  # QVERIS-INTEGRATION
-    try:  # QVERIS-INTEGRATION
-        payload = QVerisClient(config).search("status", limit=1)  # QVERIS-INTEGRATION
-        console.print(f"[green]QVeris reachable.[/green] remaining_credits={payload.get('remaining_credits')}")  # QVERIS-INTEGRATION
-        return EXIT_SUCCESS  # QVERIS-INTEGRATION
-    except Exception as exc:  # noqa: BLE001  # QVERIS-INTEGRATION
-        console.print(f"[red]QVeris status failed:[/red] {exc}")  # QVERIS-INTEGRATION
-        return EXIT_RUN_FAILED  # QVERIS-INTEGRATION
-# QVERIS-INTEGRATION
-def cmd_qveris_enable(*, key: str | None = None, url: str | None = None) -> int:  # QVERIS-INTEGRATION
-    """Enable QVeris if an API key is present or supplied."""  # QVERIS-INTEGRATION
-    from src.tools.qveris_tool import SIGNUP_URL, INVITE_CODE, QVerisConfig, _read_config_file, save_qveris_config  # QVERIS-INTEGRATION
-    existing = _read_config_file()  # QVERIS-INTEGRATION
-    api_key = (key or existing.api_key or "").strip()  # QVERIS-INTEGRATION
-    if not api_key:  # QVERIS-INTEGRATION
-        console.print("[yellow]QVeris API key is required to enable the integration.[/yellow]")  # QVERIS-INTEGRATION
-        console.print(f"[dim]Sign up: {SIGNUP_URL}  invite_code={INVITE_CODE}[/dim]")  # QVERIS-INTEGRATION
-        return EXIT_USAGE_ERROR  # QVERIS-INTEGRATION
-    base_url = (url or existing.base_url).strip().rstrip("/")  # QVERIS-INTEGRATION
-    if not base_url.startswith(("http://", "https://")):  # QVERIS-INTEGRATION
-        console.print("[red]--url must start with http:// or https://[/red]")  # QVERIS-INTEGRATION
-        return EXIT_USAGE_ERROR  # QVERIS-INTEGRATION
-    saved = save_qveris_config(QVerisConfig(True, base_url, api_key, "paid", existing.budget_credits_per_session))  # QVERIS-INTEGRATION
-    console.print("[green]QVeris paid route enabled.[/green]")  # QVERIS-INTEGRATION
-    _print_qveris_config(saved)  # QVERIS-INTEGRATION
-    return EXIT_SUCCESS  # QVERIS-INTEGRATION
-# QVERIS-INTEGRATION
-def cmd_qveris_mode(
-    *,
-    mode: str,
-    budget: float | None = None,
-    key: str | None = None,
-    url: str | None = None,
-) -> int:  # QVERIS-INTEGRATION
-    """Switch QVeris between free and paid modes."""  # QVERIS-INTEGRATION
-    from src.tools.qveris_tool import QVerisConfig, _read_config_file, normalize_qveris_mode, save_qveris_config  # QVERIS-INTEGRATION
-    existing = _read_config_file()  # QVERIS-INTEGRATION
-    next_mode = normalize_qveris_mode(mode)  # QVERIS-INTEGRATION
-    next_budget = existing.budget_credits_per_session if budget is None else max(float(budget), 0.0)  # QVERIS-INTEGRATION
-    base_url = (url or existing.base_url).strip().rstrip("/")  # QVERIS-INTEGRATION
-    if not base_url.startswith(("http://", "https://")):  # QVERIS-INTEGRATION
-        console.print("[red]--url must start with http:// or https://[/red]")  # QVERIS-INTEGRATION
-        return EXIT_USAGE_ERROR  # QVERIS-INTEGRATION
-    api_key = (key or existing.api_key or "").strip()  # QVERIS-INTEGRATION
-    saved = save_qveris_config(QVerisConfig(next_mode == "paid", base_url, api_key, next_mode, next_budget))  # QVERIS-INTEGRATION
-    console.print(f"[green]QVeris mode set to {next_mode}.[/green]")  # QVERIS-INTEGRATION
-    _print_qveris_config(saved)  # QVERIS-INTEGRATION
-    return EXIT_SUCCESS  # QVERIS-INTEGRATION
-# QVERIS-INTEGRATION
-def cmd_qveris_disable() -> int:  # QVERIS-INTEGRATION
-    """Disable QVeris without deleting the stored key."""  # QVERIS-INTEGRATION
-    from src.tools.qveris_tool import QVerisConfig, _read_config_file, save_qveris_config  # QVERIS-INTEGRATION
-    existing = _read_config_file()  # QVERIS-INTEGRATION
-    save_qveris_config(QVerisConfig(False, existing.base_url, existing.api_key, "free", existing.budget_credits_per_session))  # QVERIS-INTEGRATION
-    console.print("[green]QVeris disabled.[/green]")  # QVERIS-INTEGRATION
-    return EXIT_SUCCESS  # QVERIS-INTEGRATION
-# QVERIS-INTEGRATION
-def cmd_qveris_usage() -> int:  # QVERIS-INTEGRATION
-    """Show recent QVeris usage events."""  # QVERIS-INTEGRATION
-    from src.tools.qveris_tool import QVerisClient, is_qveris_configured, load_qveris_config  # QVERIS-INTEGRATION
-    config = load_qveris_config()  # QVERIS-INTEGRATION
-    if not is_qveris_configured(config):  # QVERIS-INTEGRATION
-        console.print("[yellow]QVeris is not configured.[/yellow]")  # QVERIS-INTEGRATION
-        return EXIT_USAGE_ERROR  # QVERIS-INTEGRATION
-    try:  # QVERIS-INTEGRATION
-        payload = QVerisClient(config).usage_history(limit=10, page_size=10)  # QVERIS-INTEGRATION
-    except Exception as exc:  # noqa: BLE001  # QVERIS-INTEGRATION
-        console.print(f"[red]QVeris usage failed:[/red] {exc}")  # QVERIS-INTEGRATION
-        return EXIT_RUN_FAILED  # QVERIS-INTEGRATION
-    print(json.dumps(payload, indent=2, ensure_ascii=False))  # QVERIS-INTEGRATION
-    return EXIT_SUCCESS  # QVERIS-INTEGRATION
-def _dispatch_data(args: argparse.Namespace) -> int:  # QVERIS-INTEGRATION
-    """Dispatch user-facing data-routing commands."""  # QVERIS-INTEGRATION
-    if args.data_command == "status":  # QVERIS-INTEGRATION
-        return cmd_qveris_status()  # QVERIS-INTEGRATION
-    if args.data_command == "mode":  # QVERIS-INTEGRATION
-        return cmd_qveris_mode(mode=args.mode, budget=args.budget, key=args.key, url=args.url)  # QVERIS-INTEGRATION
-    if args.data_command == "usage":  # QVERIS-INTEGRATION
-        return cmd_qveris_usage()  # QVERIS-INTEGRATION
-    console.print("[red]data requires a subcommand.[/red] Try: vibe-trading data status")  # QVERIS-INTEGRATION
-    return EXIT_USAGE_ERROR  # QVERIS-INTEGRATION
-# QVERIS-INTEGRATION
+def _dispatch_data(args: argparse.Namespace) -> int:
+    """Show the optional data partner and the features selected for this process."""
+    from src.config.gildata_features import selected_features
+
+    _ensure_cli_env()
+    console.print("Gildata: " + (", ".join(selected_features()) or "no optional research features selected"))
+    console.print("Gildata: https://www.gildata.com/products/datamap")
+    return EXIT_SUCCESS
+
+
 def _live_server_config(broker: str):
     """Resolve the protected MCP server config for ``broker``.
 
@@ -3895,6 +3831,19 @@ def cmd_live_revoke(broker: str) -> int:
     return EXIT_SUCCESS
 
 
+def _preview_live_spending(broker: str) -> bool:
+    """Show operator settings before either foreground or background start."""
+    from urllib.parse import urlencode
+
+    preview = _live_api_call("GET", "/live/runner/settings?" + urlencode({"broker": broker}))
+    if preview.get("status") == "error":
+        console.print("[red]Could not read runner model-spending settings; not starting.[/red]")
+        return False
+    console.print("[yellow]Model calls are billed independently of trade limits.[/yellow]")
+    console.print_json(data=preview)
+    return True
+
+
 def cmd_live_start(broker: Optional[str] = None) -> int:
     """Start the persistent live runner in the background (SPEC §7.5).
 
@@ -3911,6 +3860,8 @@ def cmd_live_start(broker: Optional[str] = None) -> int:
         Process exit code. ``EXIT_RUN_FAILED`` when the server is unreachable.
     """
     key = (broker or _DEFAULT_LIVE_BROKER).strip().lower()
+    if not _preview_live_spending(key):
+        return EXIT_RUN_FAILED
     result = _live_api_call(
         "POST", "/live/runner/start", body={"broker": key, "foreground": False}
     )
@@ -3970,6 +3921,9 @@ def cmd_live_run(broker: Optional[str] = None) -> int:
     """
     key = (broker or _DEFAULT_LIVE_BROKER).strip().lower()
     runner_id = _runner_id_for(key)
+
+    if not _preview_live_spending(key):
+        return EXIT_RUN_FAILED
 
     result = _live_api_call(
         "POST", "/live/runner/start", body={"broker": key, "foreground": True}
@@ -4181,6 +4135,13 @@ def _print_portfolio_snapshot(snapshot: dict[str, Any]) -> None:
             rich_escape(str(row.get("last_success_at") or "never")),
         )
     console.print(accounts)
+    for row in snapshot.get("accounts", []):
+        if row.get("status") == "ok" and row.get("balance_details"):
+            console.print(rich_escape(str(row.get("label") or row.get("broker") or "")))
+            _print_balance_details(row["balance_details"])
+        if row.get("import_metadata"):
+            meta = row["import_metadata"]
+            console.print(f"extraETF file mtime: {rich_escape(meta['source_mtime'])}; expires: {rich_escape(meta['expires_at'])}; holdings only, no cash")
 
     holdings = Table(title="Holdings (combined across sources)", box=box.SIMPLE_HEAVY, show_lines=False)
     holdings.add_column("Symbol")
@@ -4205,17 +4166,22 @@ def _print_portfolio_snapshot(snapshot: dict[str, Any]) -> None:
         console.print(f"[yellow]![/yellow] {rich_escape(str(warning))}")
 
 
-def cmd_portfolio_show(service: Any | None = None) -> int:
-    """Print the latest stored portfolio snapshot.
+def cmd_portfolio_show(service: Any | None = None, snapshot_id: str | None = None) -> int:
+    """Print the latest snapshot or one exact stored observation.
 
     Args:
         service: Optional ``PortfolioService`` (tests inject a stub).
+        snapshot_id: Optional immutable snapshot id; never falls back to latest.
 
     Returns:
         The process exit code.
     """
-    snapshot = _portfolio_service(service).latest()
+    instance = _portfolio_service(service)
+    snapshot = instance.latest() if snapshot_id is None else instance.snapshot_by_id(snapshot_id)
     if snapshot is None:
+        if snapshot_id is not None:
+            console.print("[red]The requested portfolio snapshot is unavailable.[/red]")
+            return EXIT_RUN_FAILED
         console.print(
             "[dim]No portfolio snapshot yet. Select sources on the Web UI Portfolio page "
             "(or `vibe-trading portfolio sources`), then run `vibe-trading portfolio refresh`.[/dim]"
@@ -4264,9 +4230,18 @@ def cmd_portfolio_sources(service: Any | None = None) -> int:
     table.add_column("Transport")
     table.add_column("Credentials", justify="center")
     for row in rows:
+        connection_cell = (
+            f"[cyan]{rich_escape(str(row.get('connection_id') or row.get('id')))}[/cyan]"
+            f"\n[dim]{rich_escape(str(row.get('label') or ''))}[/dim]"
+        )
+        account_ref = str(row.get("account_ref") or "")
+        if account_ref:
+            connection_cell += f"\n[dim]account ····{rich_escape(account_ref[-4:])}[/dim]"
+        elif row.get("account_selection_required"):
+            connection_cell += "\n[yellow]no account selected[/yellow]"
         table.add_row(
             "[green]*[/green]" if row.get("selected") else "",
-            f"[cyan]{rich_escape(str(row.get('connection_id') or row.get('id')))}[/cyan]\n[dim]{rich_escape(str(row.get('label') or ''))}[/dim]",
+            connection_cell,
             rich_escape(str(row.get("connector") or "")),
             rich_escape(str(row.get("environment") or "")),
             rich_escape(str(row.get("transport") or "")),
@@ -4289,11 +4264,45 @@ def _dispatch_portfolio(args: argparse.Namespace) -> int:
     """
     sub = getattr(args, "portfolio_command", None) or "show"
     if sub == "show":
-        return cmd_portfolio_show()
+        return cmd_portfolio_show(snapshot_id=getattr(args, "snapshot_id", None))
     if sub == "refresh":
         return cmd_portfolio_refresh()
     if sub == "sources":
         return cmd_portfolio_sources()
+    if sub == "import-extraetf":
+        from datetime import datetime, timezone
+        from src.portfolio.imports import MAX_IMPORT_BYTES
+        try:
+            path = Path(args.file).expanduser()
+            with path.open("rb") as handle:
+                data = handle.read(MAX_IMPORT_BYTES + 1)
+                modified = os.fstat(handle.fileno()).st_mtime
+            if len(data) > MAX_IMPORT_BYTES:
+                raise ValueError("extraETF export exceeds the 4 MiB import limit")
+            instance = _portfolio_service()
+            imported = instance.settings_store.import_store.create(
+                csv_text=data.decode("utf-8-sig"), label=args.label,
+                source_mtime=datetime.fromtimestamp(modified, timezone.utc).isoformat(),
+                expected_positions=args.expected_positions, max_age_days=args.max_age_days,
+            )
+            if args.select:
+                settings = instance.settings()
+                settings["sources"].append({"connection_id": imported["id"], "source_kind": "extraetf",
+                                            "label": imported["label"], "include_cash": False})
+                instance.save_settings(settings)
+            console.print_json(data=imported)
+            return 0
+        except (ValueError, OSError) as exc:
+            console.print(f"[red]{rich_escape(str(exc))}[/red]")
+            return 1
+    if sub == "rebalance":
+        try:
+            target = json.loads(Path(args.targets).read_text())
+            console.print_json(data=_portfolio_service().rebalance(args.snapshot_id, target))
+            return 0
+        except (ValueError, OSError) as exc:
+            console.print(f"[red]{rich_escape(str(exc))}[/red]")
+            return 1
     console.print(f"[red]Unknown portfolio subcommand: {sub}[/red]")
     return EXIT_USAGE_ERROR
 
@@ -4455,23 +4464,48 @@ def cmd_connector_setup(
     connection_id: str | None = None,
     label: str | None = None,
     skip_check: bool = False,
+    account: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
 ) -> int:
-    """Create a local read-only connection and collect secrets outside AI prompts."""
+    """Create a local read-only connection and collect secrets outside AI prompts.
+
+    Args:
+        profile_id: Read-only portfolio profile to connect through.
+        connection_id: Local id; defaults to ``<connector>-<environment>``.
+        label: Display name; defaults to the profile label.
+        skip_check: Skip the connectivity check (and, for an account-scoped
+            profile, the account selection that needs the broker).
+        account: Account to scope an account-scoped connection to; without it
+            the user picks from the broker's account list.
+        host: Optional connection-specific IBKR/Futu gateway host; requires port.
+        port: Optional connection-specific gateway port; requires host.
+
+    Returns:
+        The process exit code.
+    """
+    from dataclasses import replace
+
     from src.trading.connections import (
         ConnectionStore,
         credential_field_catalog,
-        is_portfolio_connection_profile,
+        is_readonly_connection_profile,
+        requires_account_selection,
     )
     from src.trading.profiles import profile_by_id
     from src.trading.service import check_connection
 
     try:
         profile = profile_by_id(profile_id)
-        if not is_portfolio_connection_profile(profile):
-            raise ValueError(f"{profile.id} is not a read-only portfolio profile")
+        if not is_readonly_connection_profile(profile):
+            raise ValueError(f"{profile.id} is not a read-only connection profile")
+        if (host is None) != (port is None):
+            raise ValueError("gateway endpoint requires both --host and --port")
         local_id = str(connection_id or f"{profile.connector}-{profile.environment}").strip().lower()
         store = ConnectionStore()
         connection = store.ensure(local_id, profile.id, label or profile.label)
+        if host is not None:
+            connection = store.save(replace(connection, endpoint={"host": host, "port": port}))
         fields = credential_field_catalog(profile.id)
         names = [str(field["name"]) for field in fields]
         status = store.credentials.status(connection.id, names) if names else {}
@@ -4504,7 +4538,13 @@ def cmd_connector_setup(
         f"[green]Local read-only connection ready[/green] "
         f"{connection.id} [dim]({connection.profile_id})[/dim]"
     )
+    needs_account = requires_account_selection(profile)
     if skip_check:
+        if needs_account and not connection.account_ref:
+            console.print(
+                f"[yellow]Select the account this connection reads:[/yellow] "
+                f"vibe-trading connector select-account {connection.id}"
+            )
         return EXIT_SUCCESS
     try:
         report = check_connection(profile.id, connection_id=connection.id)
@@ -4518,6 +4558,69 @@ def cmd_connector_setup(
         )
         return EXIT_RUN_FAILED
     console.print("[green]Connection test passed.[/green]")
+    if needs_account and (account is not None or not connection.account_ref):
+        return cmd_connector_select_account(connection.id, account=account)
+    return EXIT_SUCCESS
+
+
+def cmd_connector_select_account(
+    connection_id: str,
+    *,
+    account: str | None = None,
+    clear: bool = False,
+) -> int:
+    """Scope an account-scoped connection to one account from the broker's list.
+
+    There is no default: without ``account`` the user picks from the list, and
+    an account the broker does not list is refused.
+
+    Args:
+        connection_id: Connection to update.
+        account: Account reference to select; prompts when omitted.
+        clear: Remove the selection instead.
+
+    Returns:
+        The process exit code.
+    """
+    from src.trading.accounts import AccountListUnavailable, choose_account, connection_accounts
+    from src.trading.connections import ConnectionStore
+
+    store = ConnectionStore()
+    try:
+        connection = store.get(connection_id)
+        if clear:
+            store.select_account(connection.id, "")
+            console.print(f"[green]Cleared the account selection of[/green] {connection.id}")
+            return EXIT_SUCCESS
+        choices = connection_accounts(connection)
+        if account is None:
+            usable = [row for row in choices if not row.get("deactivated")]
+            if not usable:
+                raise ValueError("this login reaches no active account")
+            table = Table(title="Accounts", box=box.SIMPLE_HEAVY)
+            table.add_column("#", justify="right")
+            table.add_column("Account")
+            table.add_column("Broker default", justify="center")
+            table.add_column("Agentic trading", justify="center")
+            for index, row in enumerate(usable, start=1):
+                table.add_row(
+                    str(index),
+                    rich_escape(str(row.get("label") or "")),
+                    "yes" if row.get("is_default") else "",
+                    "allowed" if row.get("agentic_allowed") else "[dim]not allowed[/dim]",
+                )
+            console.print(table)
+            pick = Prompt.ask("Account", choices=[str(index) for index in range(1, len(usable) + 1)])
+            account = str(usable[int(pick) - 1]["account_ref"])
+        chosen = choose_account(choices, account.strip())
+        store.select_account(connection.id, str(chosen["account_ref"]))
+    except AccountListUnavailable as exc:
+        console.print(f"[red]Could not read the account list:[/red] {rich_escape(str(exc))}")
+        return EXIT_RUN_FAILED
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]Account selection failed:[/red] {rich_escape(str(exc))}")
+        return EXIT_USAGE_ERROR
+    console.print(f"[green]{connection.id} now reads[/green] {rich_escape(str(chosen.get('label') or ''))}")
     return EXIT_SUCCESS
 
 
@@ -4537,8 +4640,32 @@ def _first_present(row: dict[str, Any], *keys: str) -> Any:
 
 
 def _print_connector_balances(result: dict[str, Any]) -> int:
-    """Render the multi-currency balances table returned by ``broker_sdk`` connectors."""
+    """Render the ``balances`` list returned by ``broker_sdk`` connectors.
+
+    Two row shapes arrive here. Longbridge reports one row per currency with
+    net assets, cash, buying power and margins. ccxt (Binance spot) reports one
+    row per asset with ``free`` / ``used`` / ``total``, where ``used`` is locked
+    in open orders. Each shape gets its own columns: read through the other
+    one's keys, every cell was empty (#1539), and a coin quantity is not a
+    net-asset figure.
+    """
     cell = lambda v: "" if v is None else str(v)  # noqa: E731
+    rows = result.get("balances", [])
+    if any("asset" in row for row in rows):
+        table = Table(
+            title=f"Asset Balances · {result.get('profile_id')}",
+            caption=f"{len(rows)} non-zero balances",
+            box=box.SIMPLE_HEAVY,
+            show_lines=False,
+        )
+        table.add_column("Asset")
+        table.add_column("Free", justify="right")
+        table.add_column("Locked", justify="right")
+        table.add_column("Total", justify="right")
+        for row in rows:
+            table.add_row(cell(row.get("asset")), cell(row.get("free")), cell(row.get("used")), cell(row.get("total")))
+        console.print(table)
+        return EXIT_SUCCESS
     table = Table(title=f"Account Balances · {result.get('profile_id')}", box=box.SIMPLE_HEAVY, show_lines=False)
     table.add_column("Currency")
     table.add_column("Net Assets", justify="right")
@@ -4546,7 +4673,7 @@ def _print_connector_balances(result: dict[str, Any]) -> int:
     table.add_column("Buy Power", justify="right")
     table.add_column("Init Margin", justify="right")
     table.add_column("Maint Margin", justify="right")
-    for row in result.get("balances", []):
+    for row in rows:
         table.add_row(
             cell(row.get("currency")),
             cell(row.get("net_assets")),
@@ -4554,6 +4681,57 @@ def _print_connector_balances(result: dict[str, Any]) -> int:
             cell(row.get("buy_power")),
             cell(row.get("init_margin")),
             cell(row.get("maintenance_margin")),
+        )
+    console.print(table)
+    _print_balance_details(rows)
+    return EXIT_SUCCESS
+
+
+def _print_balance_details(rows: list[dict[str, Any]]) -> None:
+    """Print broker cash legs and financing in each reported currency.
+
+    Args:
+        rows: Balance rows from a connector or a saved portfolio snapshot.
+    """
+    cell = lambda value: "—" if value is None else rich_escape(str(value))  # noqa: E731
+    for row in rows:
+        if not row.get("cash_infos") and all(row.get(key) is None for key in (
+            "max_finance_amount", "remaining_finance_amount"
+        )):
+            continue
+        currency = cell(row.get("currency"))
+        console.print(f"Cash and financing · {currency}")
+        console.print(f"Financing limit: {cell(row.get('max_finance_amount'))} {currency}; "
+                      f"Remaining financing: {cell(row.get('remaining_finance_amount'))} {currency}")
+        table = Table(box=box.SIMPLE_HEAVY)
+        for name in ("Currency", "Available", "Withdrawable", "Frozen", "Settling"):
+            table.add_column(name)
+        for cash in row.get("cash_infos") or []:
+            table.add_row(*(cell(cash.get(key)) for key in (
+                "currency", "available_cash", "withdraw_cash", "frozen_cash", "settling_cash"
+            )))
+        if table.row_count:
+            console.print(table)
+
+
+def _print_connector_assets(result: dict[str, Any]) -> int:
+    """Render Futu's per-currency ``assets`` rows from ``accinfo_query``."""
+    cell = lambda v: "" if v is None else str(v)  # noqa: E731
+    table = Table(title=f"Account Assets · {result.get('profile_id')}", box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Currency")
+    table.add_column("Total Assets", justify="right")
+    table.add_column("Cash", justify="right")
+    table.add_column("Market Value", justify="right")
+    table.add_column("Available Funds", justify="right")
+    table.add_column("Buying Power", justify="right")
+    for row in result.get("assets", []):
+        table.add_row(
+            cell(row.get("currency")),
+            cell(row.get("total_assets")),
+            cell(row.get("cash")),
+            cell(row.get("market_val")),
+            cell(row.get("available_funds")),
+            cell(row.get("power")),
         )
     console.print(table)
     return EXIT_SUCCESS
@@ -4665,6 +4843,9 @@ def _enum_text(value: Any) -> str:
 
 
 def _print_connector_account(result: dict[str, Any]) -> int:
+    if result.get("valuation_basis") == "margin_limits_not_net_liquidation":
+        console.print_json(data=result)
+        return EXIT_SUCCESS
     accounts = ", ".join(result.get("accounts", [])) or "(none)"
     rows = result.get("summary", [])
     # broker_sdk connectors (Longbridge, …) return a ``balances`` list instead of
@@ -4673,9 +4854,15 @@ def _print_connector_account(result: dict[str, Any]) -> int:
         label = accounts if accounts != "(none)" else result.get("profile_id", result.get("profile", "unknown"))
         console.print(f"Accounts: [cyan]{rich_escape(str(label))}[/cyan]")
         return _print_connector_balances(result)
+    if not rows and result.get("assets"):
+        return _print_connector_assets(result)
     account_data = _normalize_mcp_value(result.get("account"))
     if not rows and isinstance(account_data, dict) and account_data:
         return _print_connector_account_mapping(result, account_data)
+    # Trading 212 returns its cash and account metadata as two separate mappings.
+    split = {key: result[key] for key in ("cash", "metadata") if isinstance(result.get(key), dict) and result[key]}
+    if not rows and split:
+        return _print_connector_account_mapping(result, split)
     if not rows:
         # Not the broker_sdk flat shape — try the remote-MCP nested shape.
         # Robinhood's tool result double-wraps: result["data"] unwraps to
@@ -4730,12 +4917,16 @@ def cmd_connector_account(
     port: int | None = None,
     client_id: int | None = None,
     account: str | None = None,
+    connection_id: str | None = None,
 ) -> int:
     """Print account summary from a connector profile."""
     from src.trading.service import get_account
 
     try:
-        result = get_account(_profile_id(profile_id), host=host, port=port, client_id=client_id, account=account)
+        options = {"host": host, "port": port, "client_id": client_id, "account": account}
+        if connection_id is not None:
+            options["connection_id"] = connection_id
+        result = get_account(_profile_id(profile_id), **options)
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Connector account failed:[/red] {exc}")
         return EXIT_RUN_FAILED
@@ -4752,18 +4943,25 @@ def cmd_connector_positions(
     port: int | None = None,
     client_id: int | None = None,
     account: str | None = None,
+    connection_id: str | None = None,
 ) -> int:
     """Print positions from a connector profile."""
     from src.trading.service import get_positions
 
     try:
-        result = get_positions(_profile_id(profile_id), host=host, port=port, client_id=client_id, account=account)
+        options = {"host": host, "port": port, "client_id": client_id, "account": account}
+        if connection_id is not None:
+            options["connection_id"] = connection_id
+        result = get_positions(_profile_id(profile_id), **options)
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Connector positions failed:[/red] {exc}")
         return EXIT_RUN_FAILED
     if result.get("status") == "error":
         console.print(f"[red]{rich_escape(str(result.get('error')))}[/red]")
         return EXIT_RUN_FAILED
+    if result.get("valuation_basis") == "broker_books_unaggregated":
+        console.print_json(data=result)
+        return EXIT_SUCCESS
     rows = result.get("positions", [])
     if not rows:
         # Not the broker_sdk flat shape — try the remote-MCP nested shape
@@ -4982,7 +5180,10 @@ def cmd_connector_history(
         console.print(f"[red]{rich_escape(str(result.get('error')))}[/red]")
         return EXIT_RUN_FAILED
     rows = result.get("bars", [])
-    if not rows:
+    # The table used to keep only the last 20 bars, so --limit 40 still
+    # printed 20. Honor the same limit that was sent to the connector.
+    shown = rows[-limit:] if isinstance(limit, int) and limit >= 1 else []
+    if not shown:
         console.print("[dim]No historical bars returned.[/dim]")
         return EXIT_SUCCESS
     table = Table(title=f"History {result.get('symbol', symbol)} · {result.get('profile_id')}", box=box.SIMPLE_HEAVY)
@@ -4992,7 +5193,7 @@ def cmd_connector_history(
     table.add_column("Low", justify="right")
     table.add_column("Close", justify="right")
     table.add_column("Volume", justify="right")
-    for row in rows[-20:]:
+    for row in shown:
         table.add_row(
             str(row.get("date") or ""),
             str(row.get("open") or ""),
@@ -5059,6 +5260,36 @@ def cmd_connector_start(profile_id: Optional[str]) -> int:
     return cmd_live_start(broker)
 
 
+def cmd_connector_runner_settings(profile_id: Optional[str], settings_file: Optional[str] = None) -> int:
+    """Show model budgets or save a JSON settings file for a stopped runner.
+
+    Args:
+        profile_id: Selected live connector profile.
+        settings_file: Optional JSON file containing DecisionSettings fields.
+
+    Returns:
+        CLI process exit code.
+    """
+    from urllib.parse import urlencode
+
+    code, broker = _live_profile_connector(profile_id, require_runner=True)
+    if code != EXIT_SUCCESS or broker is None:
+        return code
+    path = "/live/runner/settings?" + urlencode({"broker": broker})
+    body = None
+    if settings_file:
+        try:
+            from src.live.runtime.decision_budget import DecisionSettings
+
+            body = DecisionSettings.model_validate_json(Path(settings_file).read_text()).model_dump()
+        except (OSError, ValueError) as exc:
+            console.print(f"[red]Invalid runner settings:[/red] {exc}")
+            return EXIT_USAGE_ERROR
+    result = _live_api_call("PUT" if body is not None else "GET", path, body=body)
+    console.print_json(data=result)
+    return EXIT_RUN_FAILED if result.get("status") == "error" else EXIT_SUCCESS
+
+
 def cmd_connector_stop(profile_id: Optional[str]) -> int:
     """Stop a live remote MCP connector runner."""
     code, broker = _live_profile_connector(profile_id, require_runner=True)
@@ -5120,6 +5351,15 @@ def _dispatch_connector(args: argparse.Namespace) -> int:
             connection_id=args.connection_id,
             label=args.label,
             skip_check=args.skip_check,
+            account=args.account,
+            host=args.host,
+            port=args.port,
+        )
+    if sub == "select-account":
+        return cmd_connector_select_account(
+            args.connection_id,
+            account=args.account,
+            clear=args.clear,
         )
     if sub == "check":
         options = {
@@ -5138,6 +5378,7 @@ def _dispatch_connector(args: argparse.Namespace) -> int:
             port=args.port,
             client_id=args.client_id,
             account=args.account,
+            **({"connection_id": args.connection_id} if getattr(args, "connection_id", None) else {}),
         )
     if sub == "positions":
         return cmd_connector_positions(
@@ -5146,6 +5387,7 @@ def _dispatch_connector(args: argparse.Namespace) -> int:
             port=args.port,
             client_id=args.client_id,
             account=args.account,
+            **({"connection_id": args.connection_id} if getattr(args, "connection_id", None) else {}),
         )
     if sub == "orders":
         return cmd_connector_orders(
@@ -5192,6 +5434,8 @@ def _dispatch_connector(args: argparse.Namespace) -> int:
         return cmd_connector_status(args.profile)
     if sub == "start":
         return cmd_connector_start(args.profile)
+    if sub == "runner-settings":
+        return cmd_connector_runner_settings(args.profile, args.file)
     if sub == "stop":
         return cmd_connector_stop(args.profile)
     if sub == "halt":
@@ -5207,6 +5451,17 @@ def _dispatch_connector(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # CLI entrypoint
 # ---------------------------------------------------------------------------
+
+def _positive_int(value: str) -> int:
+    """argparse type for counts that must be at least one."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {number}")
+    return number
+
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser with subcommands and compatibility flags."""
@@ -5253,23 +5508,20 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--port", type=int, default=8000, help="Listen port")
     serve_parser.add_argument("--dev", action="store_true", help="Start the Vite dev server")
 
+    office_parser = subparsers.add_parser("office", help="Manage the shared research task board")
+    office_parser.add_argument("office_args", nargs=argparse.REMAINDER)
+
     provider_parser = subparsers.add_parser("provider", help="Manage OAuth providers")
     provider_subparsers = provider_parser.add_subparsers(dest="provider_command")
     login_parser = provider_subparsers.add_parser("login", help="Authenticate with an OAuth provider")
     login_parser.add_argument("provider", help="OAuth provider name, e.g. openai-codex")
     provider_subparsers.add_parser("doctor", help="Print redacted provider diagnostics")
+    from cli.custom_providers import configure_parser as configure_custom_providers
+    configure_custom_providers(provider_subparsers.add_parser("custom", help="Manage tested custom model endpoints"))
 
-    # QVERIS-INTEGRATION
-    data_parser = subparsers.add_parser("data", help="Manage data routing mode")  # QVERIS-INTEGRATION
-    data_subparsers = data_parser.add_subparsers(dest="data_command")  # QVERIS-INTEGRATION
-    data_subparsers.add_parser("status", help="Show active data routing mode")  # QVERIS-INTEGRATION
-    data_mode = data_subparsers.add_parser("mode", help="Switch between free public data and paid data routing")  # QVERIS-INTEGRATION
-    data_mode.add_argument("mode", choices=["free", "paid"], help="free uses built-in public data; paid enables premium data execution")  # QVERIS-INTEGRATION
-    data_mode.add_argument("--budget", type=float, help="Paid-mode credit budget per session")  # QVERIS-INTEGRATION
-    data_mode.add_argument("--key", help="Premium data API key")  # QVERIS-INTEGRATION
-    data_mode.add_argument("--url", help="Premium data API base URL")  # QVERIS-INTEGRATION
-    data_subparsers.add_parser("usage", help="Show recent paid data usage")  # QVERIS-INTEGRATION
-    # QVERIS-INTEGRATION
+    data_parser = subparsers.add_parser("data", help="Show research data partner settings")
+    data_subparsers = data_parser.add_subparsers(dest="data_command", required=True)
+    data_subparsers.add_parser("status", help="Show selected Gildata features")
     channels_parser = subparsers.add_parser("channels", help="Manage IM channel adapters")
     channels_subparsers = channels_parser.add_subparsers(dest="channels_command")
     channels_status = channels_subparsers.add_parser("status", help="Show IM channel status")
@@ -5294,7 +5546,7 @@ def _build_parser() -> argparse.ArgumentParser:
     channels_pairing.add_argument("pairing_args", nargs="*", help="Pairing command arguments")
 
     list_parser = subparsers.add_parser("list", help="List runs")
-    list_parser.add_argument("--limit", dest="list_limit", type=int, default=20, help="Maximum number of runs")
+    list_parser.add_argument("--limit", dest="list_limit", type=_positive_int, default=20, help="Maximum number of runs")
 
     show_parser = subparsers.add_parser("show", help="Show run details")
     show_parser.add_argument("run_id", help="Run identifier")
@@ -5359,7 +5611,7 @@ def _build_parser() -> argparse.ArgumentParser:
     memory_search_parser = memory_subparsers.add_parser("search", help="Recall memories for a query")
     memory_search_parser.add_argument("query", help="Search text")
     memory_search_parser.add_argument(
-        "--limit", dest="memory_limit", type=int, default=5, help="Maximum matches (default: 5)"
+        "--limit", dest="memory_limit", type=_positive_int, default=5, help="Maximum matches (default: 5)"
     )
 
     memory_forget_parser = memory_subparsers.add_parser("forget", help="Remove a memory entry")
@@ -5371,10 +5623,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Read-only multi-broker portfolio (the Web UI /portfolio page, in the terminal)",
     )
     portfolio_subparsers = portfolio_parser.add_subparsers(dest="portfolio_command")
-    portfolio_subparsers.add_parser("show", help="Print the latest stored snapshot")
+    portfolio_show_parser = portfolio_subparsers.add_parser("show", help="Print a stored snapshot")
+    portfolio_show_parser.add_argument("--snapshot-id", help="Read this exact immutable snapshot")
     portfolio_subparsers.add_parser(
         "refresh", help="Read every enabled source now, store a new snapshot, and print it"
     )
+    import_parser = portfolio_subparsers.add_parser("import-extraetf", help="Import a local Investments CSV; never executes trades")
+    import_parser.add_argument("file")
+    import_parser.add_argument("--label", required=True)
+    import_parser.add_argument("--expected-positions", required=True, type=int)
+    import_parser.add_argument("--max-age-days", required=True, type=int)
+    import_parser.add_argument("--select", action="store_true", help="Add this import to selected portfolio sources")
+    rebalance_parser = portfolio_subparsers.add_parser("rebalance", help="Value-only proposal for a pinned snapshot")
+    rebalance_parser.add_argument("--snapshot-id", required=True)
+    rebalance_parser.add_argument("--targets", required=True, help="JSON file mapping canonical_id (or CASH) to target fraction")
     portfolio_subparsers.add_parser(
         "sources", help="List local read-only connections and whether the portfolio uses them"
     )
@@ -5438,6 +5700,25 @@ def _build_parser() -> argparse.ArgumentParser:
     connector_setup.add_argument("--connection-id", default=None)
     connector_setup.add_argument("--label", default=None)
     connector_setup.add_argument("--skip-check", action="store_true")
+    connector_setup.add_argument(
+        "--host", default=None, help="Connection-specific IBKR/Futu gateway host (requires --port)"
+    )
+    connector_setup.add_argument(
+        "--port", type=int, default=None, help="Connection-specific gateway port (requires --host)"
+    )
+    connector_setup.add_argument(
+        "--account",
+        default=None,
+        help="Account to scope an account-scoped connection (Robinhood) to; prompts when omitted",
+    )
+
+    connector_select_account = connector_subparsers.add_parser(
+        "select-account",
+        help="Choose the broker account an account-scoped connection reads",
+    )
+    connector_select_account.add_argument("connection_id", help="Local connection id")
+    connector_select_account.add_argument("--account", default=None, help="Account reference; prompts when omitted")
+    connector_select_account.add_argument("--clear", action="store_true", help="Remove the selection")
 
     connector_check = connector_subparsers.add_parser("check", help="Check selected connector readiness")
     _add_connector_profile_arg(connector_check)
@@ -5453,10 +5734,12 @@ def _build_parser() -> argparse.ArgumentParser:
     connector_account = connector_subparsers.add_parser("account", help="Read account summary")
     _add_connector_profile_arg(connector_account)
     _add_connector_local(connector_account)
+    connector_account.add_argument("--connection-id", default=None)
 
     connector_positions = connector_subparsers.add_parser("positions", help="Read current positions")
     _add_connector_profile_arg(connector_positions)
     _add_connector_local(connector_positions)
+    connector_positions.add_argument("--connection-id", default=None)
 
     connector_orders = connector_subparsers.add_parser("orders", help="Read open orders")
     _add_connector_profile_arg(connector_orders)
@@ -5491,6 +5774,12 @@ def _build_parser() -> argparse.ArgumentParser:
         p = connector_subparsers.add_parser(name, help=help_text)
         _add_connector_profile_arg(p)
 
+    runner_settings = connector_subparsers.add_parser(
+        "runner-settings", help="Preview model spending or save runner cadence/budgets from JSON"
+    )
+    _add_connector_profile_arg(runner_settings)
+    runner_settings.add_argument("--file", help="Validated settings JSON; stop the runner before changing it")
+
     # Alpha Zoo subcommands (registered via cli_handlers.add_subparser)
     from src.factors.cli_handlers import add_subparser as _add_alpha_subparser
     _add_alpha_subparser(subparsers)
@@ -5498,6 +5787,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # Hypothesis Registry subcommands
     from src.hypotheses.cli_handlers import add_subparser as _add_hypothesis_subparser
     _add_hypothesis_subparser(subparsers)
+
+    # Versioned research-artifact index
+    from src.research_artifacts.cli_handlers import add_subparser as _add_research_artifact_subparser
+    _add_research_artifact_subparser(subparsers)
+
+    from src.research_lab.cli import add_subparser as _add_research_lab_subparser
+    _add_research_lab_subparser(subparsers)
 
     # Scheduled-research playbook templates (list / show / create)
     from cli.commands.research_playbook import add_subparser as _add_playbook_subparser
@@ -5507,6 +5803,8 @@ def _build_parser() -> argparse.ArgumentParser:
     from cli.commands.strategy_evidence import add_subparser as _add_strategy_evidence_subparser
     _add_strategy_evidence_subparser(subparsers)
 
+    from cli.commands.paper_trade import add_parser as add_paper_parser
+    add_paper_parser(subparsers)
     return parser
 
 
@@ -5550,22 +5848,22 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_placeholder": "sk-or-v1-...",
     },
     {
-        "label": "Requesty (OpenAI-compatible gateway - multiple models)",
-        "provider": "requesty",
-        "key_env": "REQUESTY_API_KEY",
-        "base_env": "REQUESTY_BASE_URL",
-        "base_url": "https://router.requesty.ai/v1",
-        "model": "openai/gpt-4o-mini",
-        "key_prefix": None,
-        "key_placeholder": "api-key...",
-    },
-    {
         "label": "DeepSeek",
         "provider": "deepseek",
         "key_env": "DEEPSEEK_API_KEY",
         "base_env": "DEEPSEEK_BASE_URL",
         "base_url": "https://api.deepseek.com/v1",
         "model": "deepseek-v4-pro",
+        "key_prefix": "sk-",
+        "key_placeholder": "sk-...",
+    },
+    {
+        "label": "OpenCode (Go / Zen)",
+        "provider": "opencode",
+        "key_env": "OPENCODE_API_KEY",
+        "base_env": "OPENCODE_BASE_URL",
+        "base_url": "https://opencode.ai/zen/go/v1",
+        "model": "deepseek-v4.1-flash",
         "key_prefix": "sk-",
         "key_placeholder": "sk-...",
     },
@@ -5675,7 +5973,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": "MINIMAX_API_KEY",
         "base_env": "MINIMAX_BASE_URL",
         "base_url": "https://api.minimax.io/v1",
-        "model": "MiniMax-M3",
+        "model": "MiniMax-M3.1-Flash",
         "key_prefix": None,
         "key_placeholder": "api-key...",
     },
@@ -5735,7 +6033,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": None,
         "base_env": "OPENAI_CODEX_BASE_URL",
         "base_url": "https://chatgpt.com/backend-api/codex/responses",
-        "model": "openai-codex/gpt-5.4",
+        "model": "openai-codex/gpt-6-sol",
         "key_prefix": None,
         "key_placeholder": None,
     },
@@ -5756,8 +6054,6 @@ def _render_env_content(config: dict[str, str]) -> str:
         "LANGCHAIN_PROVIDER",
         "OPENROUTER_API_KEY",
         "OPENROUTER_BASE_URL",
-        "REQUESTY_API_KEY",
-        "REQUESTY_BASE_URL",
         "DEEPSEEK_API_KEY",
         "DEEPSEEK_BASE_URL",
         "NVIDIA_API_KEY",
@@ -6373,17 +6669,24 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "serve":
         return serve_main(raw_argv[1:])
+    if args.command == "office":
+        from src.pixel_agents.cli import main as office_main
+        office_main(args.office_args)
+        return 0
     if args.command == "provider":
         if args.provider_command == "login":
             return cmd_provider_login(args.provider)
         if args.provider_command == "doctor":
             return cmd_provider_doctor()
+        if args.provider_command == "custom":
+            from cli.custom_providers import run as run_custom_providers
+            return run_custom_providers(args)
         console.print("[red]provider requires a subcommand.[/red] Try: vibe-trading provider doctor")
         return EXIT_USAGE_ERROR
     if args.command == "channels":
         return _coerce_exit_code(_dispatch_channels(args))
-    if args.command == "data":  # QVERIS-INTEGRATION
-        return _coerce_exit_code(_dispatch_data(args))  # QVERIS-INTEGRATION
+    if args.command == "data":
+        return _coerce_exit_code(_dispatch_data(args))
     if args.command == "run":
         return _handle_prompt_command(
             args.run_prompt,
@@ -6408,12 +6711,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "hypothesis":
         from src.hypotheses.cli_handlers import dispatch as _hyp_dispatch
         return _coerce_exit_code(_hyp_dispatch(args))
+    if args.command == "research-artifact":
+        from src.research_artifacts.cli_handlers import dispatch as _research_artifact_dispatch
+        return _coerce_exit_code(_research_artifact_dispatch(args))
+    if args.command == "research-lab":
+        from src.research_lab.cli import dispatch as _research_lab_dispatch
+        return _coerce_exit_code(_research_lab_dispatch(args))
     if args.command == "playbook":
         from cli.commands.research_playbook import dispatch as _playbook_dispatch
         return _coerce_exit_code(_playbook_dispatch(args))
     if args.command == "strategy-evidence":
         from cli.commands.strategy_evidence import dispatch as _strategy_evidence_dispatch
         return _coerce_exit_code(_strategy_evidence_dispatch(args))
+    if args.command == "paper":
+        from cli.commands.paper_trade import dispatch as dispatch_paper
+        return dispatch_paper(args)
     if args.command == "portfolio":
         return _coerce_exit_code(_dispatch_portfolio(args))
     if args.command == "connector":

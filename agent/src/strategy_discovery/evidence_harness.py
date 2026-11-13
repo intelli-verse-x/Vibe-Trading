@@ -4,10 +4,9 @@ Builds on the artifact readers in :mod:`run_artifacts`; this module owns the
 regime labeling and the per-regime metrics. Conventions:
 
 * Trade counting — engine ``trades.csv`` artifacts hold TWO rows per round
-  trip (entry row ``pnl=0.0`` + exit row with realized pnl); only exit rows
-  are counted, so a round trip contributes exactly one trade. Legacy
-  one-row-per-trade artifacts are detected via the marker column and keep
-  counting every row (see :func:`run_artifacts.read_trade_activity`).
+  trip (``event=entry`` and ``event=exit``); only exits are counted, including
+  zero-PnL exits. Unmarked files keep their legacy PnL-based interpretation
+  (see :func:`run_artifacts.read_trade_activity`).
 * Regime labeling — each bar is labeled by the rolling cumulative benchmark
   return over the trailing ``benchmark_window`` bars ending at that bar
   (``<= bear_threshold`` → bear_market, ``>= bull_threshold`` → bull_market,
@@ -330,14 +329,25 @@ def _month_spans(bar_indices: Sequence[int], dates: Sequence[date]) -> tuple[str
     return tuple(spans)
 
 
-def _bar_returns(bar_indices: Sequence[int], series: Sequence[float]) -> list[float]:
-    """Per-bar simple returns for the given bars (previous bar may be any regime)."""
+def _bar_returns(
+    bar_indices: Sequence[int], series: Sequence[float | None]
+) -> list[float]:
+    """Per-bar simple returns for the given bars (previous bar may be any regime).
+
+    The anchor bar (``index - 1``) is deliberately outside ``bar_indices``,
+    so a caller that verified its OWN bars are present has verified nothing
+    about the anchor: the benchmark series carries ``None`` per bar wherever
+    the column was absent or unparseable. A missing endpoint yields no
+    return for that bar, the same way a non-finite one already does.
+    """
     returns: list[float] = []
     for index in bar_indices:
         if index <= 0:
             continue
         previous = series[index - 1]
         current = series[index]
+        if previous is None or current is None:
+            continue
         if previous <= 0 or not math.isfinite(previous) or not math.isfinite(current):
             continue
         returns.append(current / previous - 1.0)
@@ -484,7 +494,6 @@ def compute_evidence_for_run(
             unlabeled_trades,
         )
 
-    resolved_size = _resolve_position_size(position_size, exposures)
     breakeven_caveat = _breakeven_caveat(max_concurrent)
     last_verified = (
         today if isinstance(today, str) and today else date.today().isoformat()
@@ -500,13 +509,17 @@ def compute_evidence_for_run(
         if trades_in_regime < 1:
             continue
         bar_indices = [i for i, label in enumerate(regime_per_bar) if label == regime]
+        regime_exposures = [
+            value for i in bar_indices if (value := exposures[i]) is not None
+        ]
+        resolved_size = _resolve_position_size(position_size, regime_exposures)
 
         strategy_returns = _bar_returns(bar_indices, equities)
         compounded_return = _compounded(strategy_returns)
 
         benchmark_compounded: float | None = None
-        if all(value is not None for value in benchmarks):
-            benchmark_returns = _bar_returns(bar_indices, benchmarks)  # type: ignore[arg-type]
+        if all(benchmarks[i] is not None for i in bar_indices):
+            benchmark_returns = _bar_returns(bar_indices, benchmarks)
             benchmark_compounded = _compounded(benchmark_returns)
         excess = (
             compounded_return - benchmark_compounded
@@ -573,7 +586,7 @@ def compute_evidence_for_run(
     return rows
 
 
-def rebuild_evidence(runs: Sequence[Mapping], store: EvidenceStore) -> dict:
+def rebuild_evidence(runs: Sequence[Mapping], store: EvidenceStore, *, scope: str = "all") -> dict:
     """Atomically replace the store contents from a sequence of run specs.
 
     Each mapping needs ``strategy_id`` and ``run_dir``; an optional
@@ -592,12 +605,18 @@ def rebuild_evidence(runs: Sequence[Mapping], store: EvidenceStore) -> dict:
     ``all_rows`` still replaces (clears) the store: a rebuild is a full
     statement of the evidence, not a patch.
 
+    ``scope="strategies"`` replaces only successful strategies' full regime
+    sets, preserving all other evidence and failed retries. The default
+    ``scope="all"`` retains the original full-rebuild semantics.
+
     Eligibility vs sufficiency (plan D4): the hard gates certify run
     ELIGIBILITY from metrics.csv ``trade_count``; the per-regime rows below
     are gated by EVIDENCE SUFFICIENCY (the harness's closed-round-trip
     count). The two counts can disagree (entries without exits); that is
     intentional and documented.
     """
+    if scope not in {"all", "strategies"}:
+        raise ValueError("scope must be all or strategies")
     skipped: list[dict] = []
     all_rows: list[EvidenceRow] = []
     ok_strategies: set[str] = set()
@@ -627,6 +646,9 @@ def rebuild_evidence(runs: Sequence[Mapping], store: EvidenceStore) -> dict:
             )
             continue
         try:
+            from src.strategy_discovery.adaptation_workflow import validate_adapted_run
+
+            validate_adapted_run(strategy_id, run_dir)
             gate_ok, gate_reason = check_run_hard_gates(run_dir)
             if not gate_ok:
                 skipped.append({"run_dir": str(run_dir), "reason": gate_reason})
@@ -656,7 +678,12 @@ def rebuild_evidence(runs: Sequence[Mapping], store: EvidenceStore) -> dict:
         all_rows.extend(rows)
         ok_strategies.add(strategy_id)
 
-    written = store.replace_rows(all_rows)
+    if scope == "strategies":
+        # Replace complete regime sets for successful named runs only. A bad
+        # retry cannot erase earlier valid evidence or another strategy's rows.
+        written = store.replace_rows(all_rows, strategy_ids=sorted(ok_strategies))
+    else:
+        written = store.replace_rows(all_rows)
     return {
         "status": "ok",
         "runs": len(runs),

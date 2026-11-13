@@ -40,13 +40,13 @@ ALPHA_ID = "gtja191_156"
 __alpha_meta__ = {
     'id': 'gtja191_156',
     'theme': ['volume'],
-    'formula_latex': 'see body',
+    'formula_latex': 'MAX(RANK(DECAYLINEAR(DELTA(VWAP,5),3)), RANK(DECAYLINEAR((-1*((OPEN*0.15)+(LOW*0.85)) * DELTA(...,2)/((OPEN*0.15)+(LOW*0.85))),3)))*-1',
     'columns_required': ['open', 'high', 'low', 'close', 'volume', 'amount'],
     'extras_required': [],
     'universe': ['equity_cn'],
     'frequency': ['1d'],
     'decay_horizon': 5,
-    'min_warmup_bars': 10,
+    'min_warmup_bars': 8,
     'notes': 'MAX elementwise -> np.maximum.',
 }
 

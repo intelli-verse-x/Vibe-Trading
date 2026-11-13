@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import logging
 from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
-from typing import Any, Dict, List, Optional
 
 
 class BaseTool(ABC):
@@ -18,6 +18,11 @@ class BaseTool(ABC):
         description: Tool description shown to the LLM.
         parameters: Parameter definition in JSON Schema format.
         repeatable: Whether the tool may be called more than once.
+        replay_after_compaction: Whether an exact successful readonly call may
+            restore its run-scoped result after compaction removed the visible
+            payload, even when the tool is otherwise repeatable. Tools opting
+            in must provide an explicit freshness argument when a caller needs
+            to bypass replay (for example ``no_cache=True``).
     """
 
     name: str = ""
@@ -29,6 +34,11 @@ class BaseTool(ABC):
     # same result, so the loop may serve repeated identical calls from cache
     # instead of re-executing them (financial_rigor calc/verify, etc.).
     deterministic: bool = False
+    # Mutable/read-through tools can stay repeatable during normal operation
+    # while opting into replay only when compaction has removed an exact prior
+    # successful result. The loop still bypasses replay for explicit freshness
+    # requests such as ``no_cache=True``.
+    replay_after_compaction: bool = False
 
     @classmethod
     def check_available(cls) -> bool:
@@ -130,6 +140,19 @@ class ToolRegistry:
                 )
             return json.dumps(payload, ensure_ascii=False)
         try:
+            # The registry is shared by agent, Swarm and MCP execution. Keep
+            # explicit policy enforcement here so a direct/unoffered call
+            # cannot bypass it. Claude CLI retains its adapter defaults.
+            from src.providers.tool_policy import _deny_prefixes, screen_calls
+
+            if name.startswith(_deny_prefixes()):
+                return json.dumps({"status": "error", "skipped": True,
+                                   "error": f"{name} is disabled by the active tool policy"})
+            if name in {"bash", "background_run", "cancel_background"}:
+                accepted, notes = screen_calls([{"name": name, "arguments": params}], {name})
+                if notes:
+                    return json.dumps({"status": "error", "skipped": True, "error": notes[0]})
+                params = accepted[0]["arguments"]
             return tool.execute(**params)
         except Exception as exc:
             logger.exception("Tool %s failed", name)

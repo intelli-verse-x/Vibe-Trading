@@ -29,6 +29,7 @@ from src.factors.base import (
     ts_min,
     ts_rank,
     ts_std,
+    vwap,
 )
 
 __alpha_meta__ = {
@@ -41,7 +42,7 @@ __alpha_meta__ = {
     "universe": ["equity_cn"],
     "frequency": ["1d"],
     "decay_horizon": 10,
-    "min_warmup_bars": 11,
+    "min_warmup_bars": 10,
     "notes": 'Open-minus-10d-vwap rank times negative rank of |close-vwap|.',
 }
 
@@ -49,5 +50,5 @@ def compute(panel: dict) -> pd.DataFrame:
     o = panel["open"]
     c = panel["close"]
     v = panel["volume"]
-    vw = safe_div(panel["amount"], v * 100.0 + 1.0)
+    vw = vwap(panel, "equity_cn")
     return rank(o - ts_mean(vw, 10)) * (-1.0 * rank((c - vw).abs()))

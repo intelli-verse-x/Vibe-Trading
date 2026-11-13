@@ -5,9 +5,12 @@ Mounted by ``agent/api_server.py`` via ``register_settings_routes(app, ...)``.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import logging
 import json
 import os
+import re
 import sys as _sys
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional
@@ -19,6 +22,10 @@ from pydantic import BaseModel, Field
 
 from src.config.accessor import get_env_value, reset_env_config
 
+from src.config.gildata_features import FEATURES_ENV, GildataFeature, selected_features
+
+logger = logging.getLogger(__name__)
+
 # Agent root (agent/) — resolved from this file's location (agent/src/api/).
 _AGENT_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -26,6 +33,11 @@ _AGENT_DIR = Path(__file__).resolve().parent.parent.parent
 # ---------------------------------------------------------------------------
 # Pydantic models (defined locally -- NO shared modules, per maintainer rule)
 # ---------------------------------------------------------------------------
+
+
+# "none" is an explicit value direct OpenAI needs to allow function tools on
+# gpt-5.6-* models; a provider with its own levels lists them in llm_providers.json.
+DEFAULT_REASONING_EFFORTS = ("none", "low", "medium", "high", "max")
 
 
 class LLMProviderOption(BaseModel):
@@ -36,11 +48,15 @@ class LLMProviderOption(BaseModel):
     api_key_env: Optional[str] = None
     base_url_env: str
     default_model: str
+    model_options: List[str] = Field(default_factory=list)
     default_base_url: str
     base_url_options: List[str] = Field(default_factory=list)
     api_key_required: bool = True
     auth_type: str = "api_key"
     login_command: Optional[str] = None
+    # Levels the settings form offers and the update route accepts; "" (unset)
+    # is always allowed on top of these.
+    reasoning_efforts: List[str] = Field(default_factory=lambda: list(DEFAULT_REASONING_EFFORTS))
 
 
 class LLMSettingsResponse(BaseModel):
@@ -82,6 +98,7 @@ class ListLLMModelsRequest(BaseModel):
     provider: str = Field(..., min_length=1)
     base_url: Optional[str] = None
     api_key: Optional[str] = None
+    refresh: bool = False
 
 
 ModelDiscoveryWarningCode = Literal[
@@ -98,6 +115,12 @@ class LLMModelsResponse(BaseModel):
     models: List[str]
     source: str
     warning_code: Optional[ModelDiscoveryWarningCode] = None
+    # Model id -> reasoning effort levels it accepts; an empty list means the
+    # model takes no effort setting. Only providers that report it fill this.
+    effort_levels: Optional[Dict[str, List[str]]] = None
+    # Optional display metadata. IDs remain canonical and editable.
+    model_labels: Optional[Dict[str, str]] = None
+    default_effort_levels: Optional[Dict[str, str]] = None
 
 
 class SourceOrderEntry(BaseModel):
@@ -123,6 +146,9 @@ class DataSourceSettingsResponse(BaseModel):
 
     tushare_token_configured: bool
     tushare_token_hint: Optional[str] = None
+    gildata_features: list[GildataFeature] = Field(default_factory=list)
+    gildata_token_configured: bool
+    gildata_token_hint: Optional[str] = None
     baostock_supported: bool
     baostock_installed: bool
     baostock_message: str
@@ -135,6 +161,9 @@ class UpdateDataSourceSettingsRequest(BaseModel):
 
     tushare_token: Optional[str] = None
     clear_tushare_token: bool = False
+    gildata_token: Optional[str] = None
+    gildata_features: list[GildataFeature] | None = None
+    clear_gildata_token: bool = False
     source_orders: Optional[List[SourceOrderUpdate]] = None
 
 
@@ -165,16 +194,14 @@ def _load_llm_providers() -> List[LLMProviderOption]:
 
 LLM_PROVIDERS = _load_llm_providers()
 LLM_PROVIDER_BY_NAME = {provider.name: provider for provider in LLM_PROVIDERS}
-# "" leaves the setting unset (Off); "none" is an explicit value direct OpenAI
-# needs to allow function tools on gpt-5.6-* models.
-LLM_REASONING_EFFORTS = {"", "none", "low", "medium", "high", "max"}
 LLM_API_KEY_PLACEHOLDERS = {"", "sk-or-v1-your-key-here", "sk-xxx", "xxx", "gsk_xxx"}
 TUSHARE_TOKEN_PLACEHOLDERS = {"", "your-tushare-token"}
+GILDATA_TOKEN_PLACEHOLDERS = {"", "your-gildata-token"}
 
 
 def _desktop_secure_credential_names() -> set[str]:
     """Return secrets owned by the desktop host when secure storage is active."""
-    names = {"TUSHARE_TOKEN", "QVERIS_API_KEY"}
+    names = {"TUSHARE_TOKEN", "GILDATA_TOKEN"}
     names.update(
         provider.api_key_env for provider in LLM_PROVIDERS if provider.api_key_env
     )
@@ -296,6 +323,95 @@ def _extract_model_ids(payload: Any) -> List[str]:
     return sorted(model_ids, key=str.casefold)[:1000]
 
 
+# Codex CLI model discovery requires a client_version query parameter. Keep
+# this value explicit and review it when updating Codex OAuth compatibility.
+# Verified with the ChatGPT Codex catalog on 2026-10-27.
+_CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
+_CODEX_MODELS_CLIENT_VERSION = "0.159.0"
+_CODEX_EFFORT_LEVELS = frozenset(LLM_PROVIDER_BY_NAME["openai-codex"].reasoning_efforts)
+
+
+async def _list_openai_codex_models(provider: LLMProviderOption) -> LLMModelsResponse:
+    """Discover ChatGPT OAuth models without sharing the token with form URLs."""
+    from src.providers.openai_codex import _build_headers, _get_codex_token
+
+    fallback = LLMModelsResponse(
+        provider=provider.name,
+        models=[provider.default_model],
+        source="default",
+        warning_code="model_list_unavailable",
+    )
+    try:
+        token = await asyncio.to_thread(_get_codex_token)
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=False, trust_env=False) as client:
+            for attempt in range(2):
+                headers = _build_headers(token.account_id, token.access)
+                headers["Accept"] = "application/json"
+                response = await client.get(
+                    _CODEX_MODELS_URL,
+                    params={"client_version": _CODEX_MODELS_CLIENT_VERSION},
+                    headers=headers,
+                )
+                if response.status_code == 401 and attempt == 0:
+                    token = await asyncio.to_thread(
+                        _get_codex_token, force_refresh=True, rejected_access=token.access
+                    )
+                    continue
+                response.raise_for_status()
+                payload = response.json()
+                break
+        if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+            return fallback
+
+        models: list[str] = []
+        efforts: dict[str, list[str]] = {}
+        labels: dict[str, str] = {}
+        defaults: dict[str, str] = {}
+        for item in payload["models"][:1000]:
+            if not isinstance(item, dict):
+                continue
+            # supported_in_api is an API-key catalog filter, not a ChatGPT
+            # entitlement check (Codex ModelPreset::filter_by_auth).
+            if item.get("visibility") != "list":
+                continue
+            slug = item.get("slug")
+            if not isinstance(slug, str) or not slug or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", slug):
+                continue
+            model_id = f"openai-codex/{slug}"
+            if model_id in models:
+                continue
+            models.append(model_id)
+            label = item.get("display_name")
+            if isinstance(label, str) and label.strip():
+                labels[model_id] = label.strip()[:128]
+            levels = item.get("supported_reasoning_levels")
+            if isinstance(levels, list):
+                supported = []
+                for level in levels:
+                    effort = level.get("effort") if isinstance(level, dict) else None
+                    if isinstance(effort, str) and effort in _CODEX_EFFORT_LEVELS and effort not in supported:
+                        supported.append(effort)
+                efforts[model_id] = supported
+            default = item.get("default_reasoning_level")
+            if (isinstance(default, str) and default in _CODEX_EFFORT_LEVELS
+                    and (model_id not in efforts or default in efforts[model_id])):
+                defaults[model_id] = default
+        if not models:
+            return fallback
+        return LLMModelsResponse(
+            provider=provider.name,
+            models=models,
+            source="provider",
+            effort_levels=efforts,
+            model_labels=labels,
+            default_effort_levels=defaults,
+        )
+    except (RuntimeError, AttributeError, httpx.HTTPError, ValueError, TypeError) as exc:
+        # Never log exception bodies here: the HTTP response could contain secrets.
+        logger.warning("OpenAI Codex model discovery unavailable (%s)", type(exc).__name__)
+        return fallback
+
+
 async def _list_provider_models(
     provider: LLMProviderOption,
     *,
@@ -304,12 +420,20 @@ async def _list_provider_models(
 ) -> LLMModelsResponse:
     """Best-effort live model discovery with a safe editable fallback."""
     fallback = [provider.default_model]
+    # Keep the direct MiniMax picker curated. Saved/custom model names remain
+    # editable, and custom endpoints retain their own live model discovery.
+    if provider.name == "minimax" and base_url.rstrip("/") in provider.base_url_options:
+        return LLMModelsResponse(
+            provider=provider.name,
+            models=provider.model_options or fallback,
+            source="default",
+        )
     if provider.auth_type in {"oauth", "gh_cli"}:
         return LLMModelsResponse(
             provider=provider.name,
             models=fallback,
             source="default",
-            warning_code=f"{provider.auth_type}_discovery_unsupported",
+            warning_code="oauth_discovery_unsupported",
         )
     if provider.api_key_required and not api_key:
         return LLMModelsResponse(
@@ -338,6 +462,13 @@ async def _list_provider_models(
             warning_code="model_list_unavailable",
         )
 
+    # Prefer configured recommendations without deleting discovered routes.
+    # Paid variants, legacy models and future releases remain selectable.
+    official_endpoints = {provider.default_base_url, *provider.base_url_options}
+    if base_url.rstrip("/") in official_endpoints:
+        preferred = [model for model in provider.model_options if model in models]
+        models = preferred + [model for model in models if model not in preferred]
+
     discovered = bool(models)
     if provider.default_model not in models:
         models.insert(0, provider.default_model)
@@ -345,6 +476,33 @@ async def _list_provider_models(
         provider=provider.name,
         models=models or fallback,
         source="provider" if discovered else "default",
+    )
+
+
+async def _list_claude_cli_models(
+    provider: LLMProviderOption, *, refresh: bool
+) -> LLMModelsResponse:
+    """List the models the local Claude Code login can run, with their effort levels."""
+    from src.providers.claude_cli_models import list_claude_cli_models
+
+    try:
+        discovered = await asyncio.to_thread(list_claude_cli_models, refresh=refresh)
+    except RuntimeError as exc:
+        logger.warning("claude-cli model list unavailable: %s", exc)
+        return LLMModelsResponse(
+            provider=provider.name,
+            models=[provider.default_model],
+            source="default",
+            warning_code="model_list_unavailable",
+        )
+    models = [model.model_id for model in discovered]
+    if provider.default_model not in models:
+        models.insert(0, provider.default_model)
+    return LLMModelsResponse(
+        provider=provider.name,
+        models=models,
+        source="provider",
+        effort_levels={model.model_id: list(model.effort_levels) for model in discovered},
     )
 
 
@@ -382,6 +540,28 @@ def _build_llm_settings_response(
             authenticated, auth_status = False, ""
         api_key_configured = authenticated
         api_key_hint = auth_status if authenticated else None
+    elif provider.auth_type == "claude_cli":
+        try:
+            from src.providers.claude_cli import get_claude_cli_auth_status
+
+            authenticated, auth_status = get_claude_cli_auth_status()
+        except Exception:
+            authenticated, auth_status = False, ""
+        api_key_configured = authenticated
+        api_key_hint = auth_status if authenticated else None
+    options = LLM_PROVIDERS
+    if provider_name == "custom":
+        from src.providers.custom_profiles import CustomProviderStore
+
+        active = next((p for p in CustomProviderStore().list_public() if p["active"]), None)
+        active_model = active["model"] if active else env_values.get("LANGCHAIN_MODEL_NAME", "")
+        active_url = active["base_url"] if active else ""
+        provider = LLMProviderOption(name="custom", label="Custom (credential vault)",
+            api_key_env=None, base_url_env="OPENAI_BASE_URL", default_model=active_model,
+            default_base_url=active_url, auth_type="credential_vault", reasoning_efforts=[])
+        env_values = {**env_values, "LANGCHAIN_MODEL_NAME": active_model, "OPENAI_BASE_URL": active_url}
+        api_key_configured, api_key_hint = bool(active and active["api_key_configured"]), None
+        options = [*LLM_PROVIDERS, provider]
     return LLMSettingsResponse(
         provider=provider.name,
         model_name=env_values.get("LANGCHAIN_MODEL_NAME", provider.default_model),
@@ -396,8 +576,29 @@ def _build_llm_settings_response(
         reasoning_effort=env_values.get("LANGCHAIN_REASONING_EFFORT", "").strip().lower(),
         sse_timeout_seconds=host._coerce_int(env_values.get("VIBE_TRADING_SSE_TIMEOUT", "90"), 90),
         env_path=host._project_relative_path(host.ENV_PATH),
-        providers=LLM_PROVIDERS,
+        providers=options,
     )
+
+
+def activate_custom_provider(profile: dict[str, Any], *, store: Any) -> dict[str, Any]:
+    """Activate tested vault metadata through the canonical settings writer.
+
+    Secrets remain in the vault. The runtime resolves model, URL and key from
+    one active profile, so it never pairs another provider's ambient key with
+    the selected endpoint. The caller holds the shared store mutation lock.
+    """
+    updates = {"LANGCHAIN_PROVIDER": "custom", "LANGCHAIN_MODEL_NAME": profile["model"]}
+    previous = store._read()
+    store.activate(profile["id"])
+    try:
+        _persist_settings_updates(updates)
+    except Exception:
+        store._write(previous)
+        raise
+    for key, value in updates.items():
+        os.environ[key] = str(value)
+    reset_env_config()
+    return {"status": "ok", "active_id": profile["id"], "model": profile["model"], "base_url": profile["base_url"]}
 
 
 def _build_source_orders(env_values: Dict[str, str]) -> List[SourceOrderEntry]:
@@ -472,6 +673,8 @@ def _build_data_source_settings_response(
     env_values = values if values is not None else _read_settings_env_values()
     token = env_values.get("TUSHARE_TOKEN", "")
     token_configured = host._is_configured_secret(token, TUSHARE_TOKEN_PLACEHOLDERS)
+    gildata = env_values.get("GILDATA_TOKEN", "")
+    gildata_configured = host._is_configured_secret(gildata, GILDATA_TOKEN_PLACEHOLDERS)
     # Late-access baostock helpers for monkeypatch compat.
     baostock_sup = getattr(host, "_baostock_supported", _baostock_supported)
     baostock_ins = getattr(host, "_baostock_installed", _baostock_installed)
@@ -486,6 +689,9 @@ def _build_data_source_settings_response(
     return DataSourceSettingsResponse(
         tushare_token_configured=token_configured,
         tushare_token_hint=None,
+        gildata_token_configured=gildata_configured,
+        gildata_token_hint=None,
+        gildata_features=selected_features(),
         baostock_supported=supported,
         baostock_installed=installed,
         baostock_message=baostock_message,
@@ -503,8 +709,11 @@ def _sync_runtime_env(provider: LLMProviderOption, updates: Dict[str, str]) -> N
         else:
             os.environ.pop(key, None)
 
-    if provider.auth_type == "gh_cli":
-        # The Copilot SDK owns credential discovery and transport.
+    if provider.auth_type == "credential_vault":
+        reset_env_config()
+        return
+    if provider.auth_type in {"gh_cli", "claude_cli"}:
+        # The Copilot SDK / Claude Code CLI own credential discovery and transport.
         os.environ.pop("OPENAI_API_KEY", None)
         os.environ.pop("OPENAI_API_BASE", None)
         os.environ.pop("OPENAI_BASE_URL", None)
@@ -602,7 +811,9 @@ def register_settings_routes(
     )
     async def get_llm_settings():
         """Return project-local LLM settings for the Web UI."""
-        return _build_llm_settings_response()
+        # gh_cli / claude_cli providers shell out for their login status; keep
+        # that off the event loop so open SSE streams are not stalled.
+        return await asyncio.to_thread(_build_llm_settings_response)
 
     @app.put(
         "/settings/llm",
@@ -614,6 +825,17 @@ def register_settings_routes(
         host_ref = _host()
         provider_name = payload.provider.strip().lower()
         provider = LLM_PROVIDER_BY_NAME.get(provider_name)
+        if provider_name == "custom":
+            from src.providers.custom_profiles import active_provider_credentials
+
+            active = active_provider_credentials()
+            if (payload.model_name.strip() != active["model"]
+                    or payload.base_url not in (None, active["base_url"])
+                    or payload.api_key or payload.clear_api_key):
+                raise HTTPException(status_code=400, detail="Edit and test a custom provider in the provider manager before activating it")
+            provider = LLMProviderOption(name="custom", label="Custom (credential vault)", api_key_env=None,
+                base_url_env="OPENAI_BASE_URL", default_model=active["model"], default_base_url=active["base_url"],
+                auth_type="credential_vault", reasoning_efforts=[])
         if provider is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported LLM provider"
@@ -632,11 +854,11 @@ def register_settings_routes(
             )
 
         reasoning_effort = (payload.reasoning_effort or "").strip().lower()
-        if reasoning_effort not in LLM_REASONING_EFFORTS:
+        if reasoning_effort and reasoning_effort not in provider.reasoning_efforts:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    "Reasoning effort must be none, low, medium, high, or max, "
+                    f"Reasoning effort must be one of {', '.join(provider.reasoning_efforts)}, "
                     "or empty to leave it unset"
                 ),
             )
@@ -685,7 +907,7 @@ def register_settings_routes(
 
         saved_values = _persist_settings_updates(updates)
         _sync_runtime_env(provider, updates)
-        return _build_llm_settings_response(saved_values)
+        return await asyncio.to_thread(_build_llm_settings_response, saved_values)
 
     @app.post(
         "/settings/llm/models",
@@ -700,6 +922,13 @@ def register_settings_routes(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported LLM provider"
             )
+        if provider.auth_type == "claude_cli":
+            # No HTTP endpoint: the base URL checks below would reject it outright.
+            return await _list_claude_cli_models(provider, refresh=payload.refresh)
+        if provider.name == "openai-codex":
+            # OAuth credentials only go to our fixed Codex catalog endpoint.
+            # Do not use base_url or api_key values supplied by the settings form.
+            return await _list_openai_codex_models(provider)
 
         current_values = _read_settings_env_values()
         requested_base_url = (payload.base_url or "").strip()
@@ -760,6 +989,13 @@ def register_settings_routes(
         elif "TUSHARE_TOKEN" in current_values:
             updates["TUSHARE_TOKEN"] = current_values["TUSHARE_TOKEN"]
 
+        if payload.clear_gildata_token:
+            updates["GILDATA_TOKEN"] = ""
+        elif payload.gildata_token is not None and payload.gildata_token.strip():
+            updates["GILDATA_TOKEN"] = payload.gildata_token.strip()
+        elif "GILDATA_TOKEN" in current_values:
+            updates["GILDATA_TOKEN"] = current_values["GILDATA_TOKEN"]
+
         # Per-market source-order overrides: validate first (400 on a bad
         # permutation *before* anything is persisted), then merge only the
         # entries that actually change the dotenv (no-op saves don't grow
@@ -773,13 +1009,23 @@ def register_settings_routes(
                 if value != current_values.get(env_var, ""):
                     updates[env_var] = value
 
+        if payload.gildata_features is not None:
+            updates[FEATURES_ENV] = ",".join(dict.fromkeys(payload.gildata_features))
+
         if updates:
             saved_values = _persist_settings_updates(updates)
-            token = updates.get("TUSHARE_TOKEN", "").strip()
-            if host_ref._is_configured_secret(token, TUSHARE_TOKEN_PLACEHOLDERS):
-                os.environ["TUSHARE_TOKEN"] = token
-            else:
-                os.environ.pop("TUSHARE_TOKEN", None)
+            for key, placeholders in (
+                ("TUSHARE_TOKEN", TUSHARE_TOKEN_PLACEHOLDERS),
+                ("GILDATA_TOKEN", GILDATA_TOKEN_PLACEHOLDERS),
+            ):
+                if key in updates:
+                    token = updates[key].strip()
+                    if host_ref._is_configured_secret(token, placeholders):
+                        os.environ[key] = token
+                    else:
+                        os.environ.pop(key, None)
+            if FEATURES_ENV in updates:
+                os.environ[FEATURES_ENV] = updates[FEATURES_ENV]
             # Hot-apply source-order overrides in this process.
             for env_var, value in order_updates.items():
                 if value:

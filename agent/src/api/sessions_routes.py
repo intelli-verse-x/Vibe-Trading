@@ -13,12 +13,72 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from src.session.events import SSEEvent
 from src.session.service import SessionBusyError
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Web composer prompt wrappers
+# ============================================================================
+# Web chat creates the session with the raw prompt (``prompt.trim().slice(0, 50)``
+# in frontend/src/pages/Agent.tsx) but POSTs a wrapped first message. These
+# mirror frontend/src/lib/chatPrompt.ts (SWARM_PROMPT_PREFIX),
+# frontend/src/lib/attachments.ts (the ``[Uploaded files: ...]`` envelope) and
+# Agent.tsx (GOAL_KICKOFF_PREFIX), and are stripped the way ``toDisplayPrompt``
+# strips them, so the auto-title route can tell a wrapped first prompt from a
+# genuine manual rename.
+_SWARM_PROMPT_PREFIX = (
+    "[Swarm Team Mode] Use the swarm tool to assemble the best specialist team "
+    "for this task. Auto-select the most appropriate preset.\n\n"
+)
+_GOAL_KICKOFF_PREFIX = "\n".join(
+    [
+        "Start working on this research goal now.",
+        "Keep it research-only, use available tools when evidence is needed, "
+        "add concrete evidence to the goal ledger, and keep going until the "
+        "goal is complete, blocked, waiting for user input, or budget-limited.",
+        "",
+        "Goal: ",
+    ]
+)
+_ATTACHMENTS_OPEN = "[Uploaded files: "
+_ATTACHMENTS_CLOSE = "]\n\n"
+_LEGACY_ATTACHMENT = re.compile(r"^\[Uploaded file: (.+), path: [^\n]*\]\n\n")
+
+
+def _strip_prompt_wrappers(content: str) -> str:
+    """Return the prompt the user typed, without the composer's envelopes."""
+    unwrapped = False
+    if content.startswith(_ATTACHMENTS_OPEN):
+        close = content.find(_ATTACHMENTS_CLOSE, len(_ATTACHMENTS_OPEN))
+        if close >= 0:
+            try:
+                payload = json.loads(content[len(_ATTACHMENTS_OPEN):close])
+            except ValueError:
+                payload = None  # Malformed envelopes stay verbatim.
+            if isinstance(payload, list) and any(
+                isinstance(item, dict) and isinstance(item.get("filename"), str)
+                and item.get("filename")
+                for item in payload
+            ):
+                content = content[close + len(_ATTACHMENTS_CLOSE):]
+                unwrapped = True
+    if not unwrapped:
+        legacy = _LEGACY_ATTACHMENT.match(content)
+        if legacy:
+            content = content[legacy.end():]
+    if content.startswith(_SWARM_PROMPT_PREFIX):
+        content = content[len(_SWARM_PROMPT_PREFIX):]
+    if content.startswith(_GOAL_KICKOFF_PREFIX):
+        content = content[len(_GOAL_KICKOFF_PREFIX):]
+    return content
 
 
 # ============================================================================
@@ -41,9 +101,14 @@ class SessionResponse(BaseModel):
     last_attempt_id: Optional[str] = None
 
 
+# Bound interactive request size. This character limit is independent of the
+# selected model's token window, which the runtime manages separately.
+MAX_MESSAGE_CHARS = 100_000
+
+
 class SendMessageRequest(BaseModel):
-    """Send chat message: natural-language strategy description."""
-    content: str = Field(..., description="Natural language strategy description", min_length=1, max_length=5000)
+    """Send an interactive research prompt."""
+    content: str = Field(..., description="Research prompt", min_length=1, max_length=MAX_MESSAGE_CHARS)
 
 
 class MessageResponse(BaseModel):
@@ -317,11 +382,24 @@ def _live_action_frame_from_tool_result(event: Any) -> Optional[str]:
 # ============================================================================
 
 def register_sessions_routes(app: FastAPI) -> None:
-    """Mount the session/goal routes onto ``app``.
+    """Mount session and goal routes using the host api_server dependencies."""
+    @app.exception_handler(RequestValidationError)
+    async def compact_message_validation(request: Request, exc: RequestValidationError):
+        """Report oversized chat input without echoing the rejected prompt."""
+        if re.fullmatch(r"/sessions/[^/]+/messages", request.url.path) and any(
+            error.get("type") == "string_too_long" and error.get("loc") == ("body", "content")
+            for error in exc.errors()
+        ):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": {
+                    "code": "message_too_long",
+                    "max_length": MAX_MESSAGE_CHARS,
+                    "message": f"Message must contain at most {MAX_MESSAGE_CHARS} characters. Shorten it before sending.",
+                }},
+            )
+        return await request_validation_exception_handler(request, exc)
 
-    Resolves shared dependencies from the host ``api_server`` module via
-    ``sys.modules``.
-    """
     import sys as _sys
 
     host = _sys.modules.get("api_server") or _sys.modules.get("agent.api_server")
@@ -639,7 +717,10 @@ def register_sessions_routes(app: FastAPI) -> None:
         svc = _host_get_session_service()
         if not svc:
             raise HTTPException(status_code=501, detail="Session runtime not enabled")
-        deleted = svc.delete_session(session_id)
+        try:
+            deleted = svc.delete_session(session_id)
+        except SessionBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not deleted:
             raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
         _get_goal_store().delete_session_goals(session_id)
@@ -658,7 +739,7 @@ def register_sessions_routes(app: FastAPI) -> None:
         if req.title is not None:
             session.title = req.title
         session.updated_at = datetime.now(timezone.utc).isoformat()
-        svc.store.update_session(session)
+        svc.update_session(session)
         return {"status": "updated", "session_id": session_id}
 
     @app.post("/sessions/{session_id}/title/auto", dependencies=[Depends(require_auth)])
@@ -684,7 +765,7 @@ def register_sessions_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=409, detail="Session has no user message to summarize")
 
         current = (session.title or "").strip()
-        auto_prefix = first_user.content.strip()[:50].strip()
+        auto_prefix = _strip_prompt_wrappers(first_user.content).strip()[:50].strip()
         if current and current != auto_prefix:
             return {"status": "kept", "session_id": session_id, "title": current}
 
@@ -723,9 +804,18 @@ def register_sessions_routes(app: FastAPI) -> None:
         if not title:
             raise HTTPException(status_code=502, detail="empty title from model")
 
+        # Generation yields to other requests. Reload their persisted metadata
+        # and recheck a manual rename before this synchronous commit section.
+        session = svc.store.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        current = (session.title or "").strip()
+        if current and current != auto_prefix:
+            return {"status": "kept", "session_id": session_id, "title": current}
+
         session.title = title
         session.updated_at = datetime.now(timezone.utc).isoformat()
-        svc.store.update_session(session)
+        svc.update_session(session)
         return {"status": "updated", "session_id": session_id, "title": title}
 
     @app.post("/sessions/{session_id}/messages", dependencies=[Depends(require_auth)])
@@ -803,12 +893,31 @@ def register_sessions_routes(app: FastAPI) -> None:
         event_id = header_id or last_event_id
         replay_active = (replay or "").lower() == "active"
         replay_all = False
+        running_attempt = None
         if replay_active and not event_id and session.last_attempt_id:
             attempt = svc.store.get_attempt(session_id, session.last_attempt_id)
             attempt_status = getattr(attempt.status, "value", attempt.status) if attempt else None
             replay_all = attempt_status == "running"
+            if replay_all:
+                running_attempt = attempt
 
         async def event_generator():
+            # The ring buffer is bounded, so a long attempt's original
+            # `attempt.started` may already have rotated out by the time a client
+            # joins. Re-announce it from the persisted attempt so the client's
+            # elapsed clock starts from the real start, not from now. Clients
+            # treat a repeated attempt.started for the same attempt as a no-op.
+            if running_attempt is not None and running_attempt.started_at:
+                yield SSEEvent(
+                    event_id=None,
+                    event_type="attempt.started",
+                    data={
+                        "attempt_id": running_attempt.attempt_id,
+                        "started_at": running_attempt.started_at,
+                        "replayed": True,
+                    },
+                    session_id=session_id,
+                ).to_sse()
             async for event in svc.event_bus.subscribe(
                 session_id,
                 last_event_id=event_id,

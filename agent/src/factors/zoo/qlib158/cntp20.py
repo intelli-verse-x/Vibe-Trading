@@ -18,12 +18,14 @@ __alpha_meta__ = {
     'universe': ['equity_us', 'equity_cn', 'equity_hk', 'equity_in', 'equity_kr'],
     'frequency': ['1d'],
     'decay_horizon': 20,
-    'min_warmup_bars': 20,
+    'min_warmup_bars': 21,
+    'notes': 'A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~15% missing bars).',
 }
 
 
 def compute(panel: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Return qlib158 CNTP20 on the supplied OHLCV panel."""
     c = panel['close']
-    up = (c > c.shift(1)).astype('float64')
+    prev = c.shift(1)
+    up = (c > prev).astype('float64').where(c.notna() & prev.notna())  # a missing close is not an up day
     return up.rolling(window=20, min_periods=20).mean()

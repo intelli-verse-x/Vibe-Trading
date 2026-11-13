@@ -84,6 +84,15 @@ def test_trace_reader_refuses_offload_path_escape(tmp_path: Path) -> None:
     assert "result" not in entry
 
 
+def test_trace_reader_keeps_unicode_line_separator_inside_json_record(tmp_path: Path) -> None:
+    trace = TraceWriter(tmp_path)
+    trace.write({"type": "note", "content": "before\u2028after\u2029end"})
+    trace.close()
+
+    [entry] = TraceWriter.read(tmp_path)
+    assert entry["content"] == "before\u2028after\u2029end"
+
+
 def test_text_field_offload_round_trips_selected_fields(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -159,6 +168,9 @@ def test_write_calls_fsync_for_crash_safety(
         trace.close()
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="directory fsync is a POSIX-only durability primitive"
+)
 def test_new_trace_file_fsyncs_parent_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

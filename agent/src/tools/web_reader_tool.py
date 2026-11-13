@@ -11,6 +11,7 @@ import requests
 
 from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
+from src.tools._arguments import boolean_argument
 from src.security.scanner import with_security_warnings
 
 logger = logging.getLogger(__name__)
@@ -140,12 +141,30 @@ class WebReaderTool(BaseTool):
         "type": "object",
         "properties": {
             "url": {"type": "string", "description": "URL of the web page to read"},
-            "no_cache": {"type": "boolean", "description": "Request a fresh (uncached) fetch", "default": False},
+            "no_cache": {
+                "type": "boolean",
+                "description": (
+                    "Request a fresh (uncached) fetch. Use only when the prior "
+                    "read explicitly reported cached=true or the task genuinely "
+                    "requires newer data. Never set no_cache merely because a "
+                    "previous result was compacted or replayed."
+                ),
+                "default": False,
+            },
         },
         "required": ["url"],
     }
     repeatable = True
+    # Normal repeated reads remain allowed while the prior payload is visible.
+    # If compaction removes an exact successful read, AgentLoop may restore the
+    # run-scoped result instead of hitting Jina/the origin again. ``no_cache``
+    # remains the explicit freshness escape hatch and bypasses that replay.
+    replay_after_compaction = True
 
     def execute(self, **kwargs) -> str:
         """Fetch web page."""
-        return read_url(kwargs["url"], no_cache=bool(kwargs.get("no_cache", False)))
+        try:
+            no_cache = boolean_argument(kwargs.get("no_cache", False), field="no_cache")
+        except ValueError as exc:
+            return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
+        return read_url(kwargs["url"], no_cache=no_cache)
